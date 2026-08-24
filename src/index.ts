@@ -1,9 +1,12 @@
 /**
  * 按需启用工具：
- * 1. 把未激活工具的短描述写进 system prompt，模型不用猜名字。
+ * 1. 按需工具目录写在 enable_tool 自己的 description / guidelines 里，会话内字节不变。
  * 2. `enable_tool` 按精确名或 query 激活（纯增量，走 deferred loading）。
  * 3. `/tools` TUI 给人手动开关。
  * 4. 选择跟会话分支走。
+ *
+ * 不要在 before_agent_start 里按「当前未激活集合」改 system prompt：
+ * 激活工具后那段会变短，前缀缓存必 miss。
  */
 
 import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
@@ -15,10 +18,16 @@ interface ToolsState {
 	enabledTools: string[];
 }
 
-const DEFERRED_BY_DEFAULT = new Set(["image_gen", "image_edit"]);
+const DEFERRED_CATALOG = [
+	{ name: "image_gen", blurb: "根据文本生成新图" },
+	{ name: "image_edit", blurb: "按参考图改图" },
+] as const;
+const DEFERRED_BY_DEFAULT = new Set<string>(DEFERRED_CATALOG.map((t) => t.name));
 const LOADER_TOOL_NAME = "enable_tool";
 const QUERY_MIN_TOKEN = 3;
 const QUERY_LIMIT = 5;
+const DEFERRED_NAMES = DEFERRED_CATALOG.map((t) => t.name).join("、");
+const DEFERRED_BLURBS = DEFERRED_CATALOG.map((t) => `\`${t.name}\`（${t.blurb}）`).join("、");
 
 export default function toolsExtension(pi: ExtensionAPI) {
 	let enabledTools: Set<string> = new Set();
@@ -103,10 +112,10 @@ export default function toolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: LOADER_TOOL_NAME,
 		label: "Enable Tool",
-		description: "Activate inactive tools by name or task query when their capability is needed.",
-		promptSnippet: "Activate inactive tools by name when needed",
+		description: `按精确名或任务关键词激活已挂起的工具。按需工具：${DEFERRED_BLURBS}。激活后完整参数 schema 只在下一轮模型请求可用，不要在同一条 assistant 消息里调用它们。`,
+		promptSnippet: "按精确名激活已挂起的工具",
 		promptGuidelines: [
-			"Check the inactive tools list in system prompt. When the user asks for a capability (e.g. image generation/editing), call enable_tool with exact tool_names before use. Newly enabled tools are available on the next model request only — do not call them in the same assistant message as enable_tool.",
+			`需要出图或改图时，先调用 enable_tool，tool_names 传精确名（${DEFERRED_NAMES}）。新工具只在下一轮请求可用，禁止与 enable_tool 同轮并行调用。`,
 		],
 		parameters: Type.Object({
 			tool_names: Type.Optional(Type.Array(Type.String(), {
@@ -166,19 +175,6 @@ export default function toolsExtension(pi: ExtensionAPI) {
 				details: { enabled: added },
 			};
 		},
-	});
-
-	pi.on("before_agent_start", async (event) => {
-		const inactive = getInactiveTools();
-		if (inactive.length === 0) return;
-
-		const listStr = inactive
-			.map((t) => `• \`${t.name}\`: ${firstSentence(t.description)}`)
-			.join("\n");
-
-		return {
-			systemPrompt: `${event.systemPrompt}\n\n## Inactive Tools (Call \`${LOADER_TOOL_NAME}\` to activate on demand)\n${listStr}`,
-		};
 	});
 
 	pi.registerCommand("tools", {
