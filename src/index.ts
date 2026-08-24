@@ -41,9 +41,17 @@ function isBuiltin(tool: ToolInfo): boolean {
 	return tool.sourceInfo?.source === "builtin";
 }
 
+function isSupported(toolOrName: ToolInfo | string): boolean {
+	const name = typeof toolOrName === "string" ? toolOrName : toolOrName.name;
+	if (name === "powershell" && process.platform !== "win32") {
+		return false;
+	}
+	return true;
+}
+
 /** 扩展工具：可挂起、进目录、可写成新会话默认。 */
 function isOnDemand(tool: ToolInfo): boolean {
-	return tool.name !== LOADER_TOOL_NAME && !isBuiltin(tool);
+	return tool.name !== LOADER_TOOL_NAME && !isBuiltin(tool) && isSupported(tool);
 }
 
 function prefsPath(): string {
@@ -105,24 +113,46 @@ export default function toolsExtension(pi: ExtensionAPI) {
 		pi.setActiveTools(Array.from(enabledTools));
 	}
 
-	function newSessionEnabled(): Set<string> {
-		const names = new Set(allTools.map((t) => t.name));
+	function newSessionEnabled(initialActiveTools: string[]): Set<string> {
+		const toolMap = new Map(allTools.map((t) => [t.name, t]));
 		const next = new Set<string>();
-		for (const tool of allTools) {
-			if (isBuiltin(tool)) next.add(tool.name);
+
+		// 1. 内置工具：只保留 Pi 启动时初始激活且当前平台支持的工具（如 read, bash, edit, write 或用户 settings.json defaultTools）
+		for (const name of initialActiveTools) {
+			const tool = toolMap.get(name);
+			if (tool && isBuiltin(tool) && isSupported(tool)) {
+				next.add(name);
+			}
 		}
+
+		// 容错兜底：若初始状态没有任何内置工具，保证最基本的读写与终端工具
+		if (next.size === 0) {
+			const standardBuiltins = ["read", "bash", "edit", "write"];
+			for (const name of standardBuiltins) {
+				const tool = toolMap.get(name);
+				if (tool && isSupported(tool)) next.add(name);
+			}
+		}
+
+		// 2. 扩展工具：默认只加载 pi-tools.json 中保存的用户偏好
 		const saved = loadDefaultEnabled();
 		if (saved) {
 			for (const name of saved) {
-				if (names.has(name)) next.add(name);
+				const tool = toolMap.get(name);
+				if (tool && isOnDemand(tool)) {
+					next.add(name);
+				}
 			}
 		}
+
+		// 3. 调度器常驻
 		next.add(LOADER_TOOL_NAME);
 		return next;
 	}
 
 	function restoreFromBranch(ctx: ExtensionContext) {
 		allTools = pi.getAllTools();
+		const currentActive = pi.getActiveTools();
 		const branchEntries = ctx.sessionManager.getBranch();
 		let savedTools: string[] | undefined;
 
@@ -136,11 +166,13 @@ export default function toolsExtension(pi: ExtensionAPI) {
 		}
 
 		if (savedTools) {
-			const allToolNames = allTools.map((t) => t.name);
-			enabledTools = new Set(savedTools.filter((t) => allToolNames.includes(t)));
+			const allToolNames = new Set(allTools.map((t) => t.name));
+			enabledTools = new Set(
+				savedTools.filter((t) => allToolNames.has(t) && isSupported(t)),
+			);
 			enabledTools.add(LOADER_TOOL_NAME);
 		} else {
-			enabledTools = newSessionEnabled();
+			enabledTools = newSessionEnabled(currentActive);
 		}
 		replaceActiveTools();
 	}
@@ -149,7 +181,7 @@ export default function toolsExtension(pi: ExtensionAPI) {
 		allTools = pi.getAllTools();
 		const activeNames = pi.getActiveTools();
 		return allTools.filter(
-			(t) => t.name !== LOADER_TOOL_NAME && !activeNames.includes(t.name),
+			(t) => t.name !== LOADER_TOOL_NAME && !activeNames.includes(t.name) && isSupported(t),
 		);
 	}
 
@@ -263,9 +295,10 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			}
 
 			allTools = pi.getAllTools();
+			const availableTools = allTools.filter(isSupported);
 
 			await ctx.ui.custom((tui, theme, _kb, done) => {
-				const items: SettingItem[] = allTools.map((tool) => ({
+				const items: SettingItem[] = availableTools.map((tool) => ({
 					id: tool.name,
 					label: tool.name === LOADER_TOOL_NAME ? `${tool.name} (auto-loader)` : tool.name,
 					currentValue: enabledTools.has(tool.name) ? "enabled" : "disabled",
