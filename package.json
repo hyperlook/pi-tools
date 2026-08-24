@@ -1,7 +1,7 @@
 {
   "name": "pi-tools",
   "version": "1.0.0",
-  "description": "Pi 按需启用工具：默认挂起重型工具，LLM 用 enable_tool 激活，人用 /tools 开关，状态跟会话分支走",
+  "description": "Pi 按需启用工具：开场扫描扩展工具写入 enable_tool 目录，人用 /tools 记非内置默认，模型用 enable_tool 只改当前会话",
   "type": "module",
   "main": "src/index.ts",
   "keywords": [
