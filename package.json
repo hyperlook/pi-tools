@@ -11,8 +11,12 @@
     "tools",
     "deferred-tools"
   ],
-  "author": "look",
+  "author": "hyperlook",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hyperlook/pi-tools.git"
+  },
   "files": [
     "src",
     "README.md"

@@ -1,23 +1,79 @@
 # pi-tools
 
-给 Pi 用的按需工具加载扩展。会话开始扫一遍本机已注册工具：内置默认开，扩展工具默认关。目录写进 `enable_tool` 的 description / guidelines，**开场冻住、会话内不变**，避免按「当前失活名单」改 system prompt 打爆前缀缓存。完整 schema 出现在下一轮请求。
+Pi 编码助手的**按需工具加载与管理扩展**（Deferred Tool Loader & Manager）。
 
-不把工具名写进源码。别人装这包、你自己再加一个扩展，下一场会话都会进目录。
+会话开始时自动扫描本机所有已注册工具：**内置工具默认开启，第三方/自定义扩展工具默认挂起（按需加载）**。通过向模型提供轻量级的 `enable_tool` 调度工具，在需要时增量激活具体工具，大幅削减 Prompt Token 占用，并保护 LLM 的前缀缓存（Prompt Cache）。
 
-## 能力
+---
 
-- **开场目录**：`getAllTools()` 里非内置、且不是 `enable_tool` 的，写进 loader 广告。这是已安装按需工具的快照，不是当前失活列表。你中途用 `/tools` 关掉某个已在目录里的工具，模型仍然看得到名字。
-- **`/tools`**：TUI 开关任意工具。非内置的开集写入 `~/.pi/agent/pi-tools.json`，作为以后新会话的默认。内置开关只影响当前会话。`enable_tool` 本身不能关。
-- **`enable_tool`**：模型按精确名或 query 激活未启用的工具（最短 3 字符、计分、最多 5 个）。只改当前会话，不改默认。激活是纯增量，走 Pi 的 deferred loading。
-- **新会话默认**：内置始终开。还没用过 `/tools` 时，扩展工具全关。用过之后，按你上次手动开着的那批扩展工具来。新装的扩展工具会进目录，默认关，直到你打开或模型 `enable_tool`。
-- **分支持久化**：当前会话状态存在 `tools-config` 自定义条目里，跟会话叶子走。`/tree` 切分支能还原。
-- **缓存**：不按「当前未激活集合」改 system prompt。loader 始终在线。Anthropic 4.5+ / GPT-5.4+ 可走官方 deferred loading 保住前缀；Gemini 等走 fallback，tools 数组仍可能让对话前缀 miss。
+## 核心特性
 
-这包会在 `session_start` 里收回扩展工具的 active 集。若要它说了算，把它放在 `packages` 列表后面。
+- ⚡ **节省 Context & 保护前缀缓存**：
+  - 目录在会话开场时生成并冻结在 `enable_tool` 的描述中，**会话内不再按「实时失活名单」动态改动 System Prompt**，避免破坏 Anthropic / OpenAI / DeepSeek 等模型的前缀缓存。
+- 🔍 **智能按需激活（`enable_tool`）**：
+  - 模型可根据任务需求，通过**精确名称**或**关键词语义检索**（query 计分）按需激活目标工具。
+  - 激活为纯增量模式，完整参数 Schema 在下一轮请求生效。
+- 🎛️ **交互式管理（`/tools`）**：
+  - 提供可视化的 TUI 开关面板。
+  - 手动调整非内置工具的开闭状态会自动记入全局偏好（`~/.pi/agent/pi-tools.json`），作为后续新会话的默认设置。
+- 🌿 **支持会话分支持久化**：
+  - 会话激活状态与会话树（`/tree`）分支严格绑定，切换分支自动恢复对应的工具状态。
+- 🌐 **环境无缝兼容**：
+  - 基于标准 Node.js / Web 规范开发，无论是 **Node.js** 环境还是 **Bun** 环境运行的 Pi，均可直接即插即用，无需预编译。
 
-## 安装
+---
 
-和 `pi-imagine`、`pi-web-search2` 一样，写进 `~/.pi/agent/settings.json` 的 `packages`：
+## 安装与配置
+
+### 方式 1：使用 Pi CLI 命令一键安装（推荐）
+
+```bash
+pi install git:github.com/hyperlook/pi-tools
+```
+
+> 如果需要临时试用而不写入全局配置：
+> ```bash
+> pi -e git:github.com/hyperlook/pi-tools
+> ```
+
+### 方式 2：在 `settings.json` 中配置
+
+在 `~/.pi/agent/settings.json`（全局）或 `.pi/settings.json`（项目级）的 `packages` 中添加：
+
+```json
+{
+  "packages": [
+    "git:github.com/hyperlook/pi-tools"
+  ]
+}
+```
+
+> **提示**：建议将 `pi-tools` 放置在 `packages` 列表的**靠后位置**，确保它在 `session_start` 时能完整扫描到先加载的其他扩展所注册的工具。
+
+---
+
+## 使用指南
+
+### 1. 交互指令 `/tools`
+在 TUI 模式下输入 `/tools` 回车，即可呼出工具管理面板：
+- 使用方向键与空格/回车切换工具状态（`enabled` / `disabled`）。
+- **非内置工具**的开关会被持久化为全局默认偏好。
+- **内置核心工具**（如 `read`, `bash`, `edit`, `write`）的调整仅影响当前会话。
+- `enable_tool` 自身始终保持开启，不可禁用。
+
+### 2. 模型自动激活
+当 LLM 发现当前激活的工具无法满足任务需求时，会主动调用 `enable_tool`：
+- **精确指定**：如 `enable_tool(tool_names: ["web_search", "url_context"])`
+- **意图检索**：如 `enable_tool(query: "search the web")`
+- 激活后，工具参数 Schema 会在下一轮请求中自动就绪。
+
+---
+
+## 本地开发与贡献
+
+### 源码链接安装（本地调试）
+
+如果你正在本地修改本插件源码，可将本地相对路径或绝对路径加入 `~/.pi/agent/settings.json`：
 
 ```json
 {
@@ -26,21 +82,25 @@
   ]
 }
 ```
+*(相对路径相对于 `settings.json` 所在目录)*
 
-相对路径相对 `~/.pi/agent/settings.json`，解析到 `~/github/pi-tools`。
+修改源码后，在 Pi 会话中直接执行 `/reload` 即可热重载。
 
-不要再把 `tools.ts` 拷进 `~/.pi/agent/extensions/`：那个目录会自动加载，和本包叠在一起会注册两次。
+### 依赖与环境
+- **运行时环境**：Node.js >= 18 或 Bun。
+- **类型检查**：
+  ```bash
+  bun x tsc --noEmit
+  # 或
+  npx tsc --noEmit
+  ```
 
-改完代码后在 Pi 里 `/reload` 即可，本地路径包不会复制，读的就是这个仓库。
+---
 
-## 命令
+## 配置文件说明
 
-| 命令 | 说明 |
-| --- | --- |
-| `/tools` | 打开工具开关面板（仅 TUI）。非内置的选择会记成新会话默认。 |
+- `~/.pi/agent/pi-tools.json`：保存用户通过 `/tools` 选定的「默认开启的扩展工具列表」。文件由面板自动维护，通常无需手动编辑。
 
-`~/.pi/agent/pi-tools.json` 由 `/tools` 自动写，一般不用手改。只含你想默认开的扩展工具名，不含内置。
+## 开源协议
 
-## 开发
-
-仓库在 `~/github/pi-tools`。Pi 核心包是 peer，不进本仓库的 `node_modules`。
+[MIT License](LICENSE)
