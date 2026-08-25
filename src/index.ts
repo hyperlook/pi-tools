@@ -13,8 +13,8 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 interface ToolsState {
@@ -86,6 +86,41 @@ function catalogFrom(tools: ToolInfo[]): CatalogEntry[] {
 		name: tool.name,
 		blurb: firstSentence(tool.description).slice(0, 80) || tool.name,
 	}));
+}
+
+function formatToolDescription(tool: ToolInfo): string {
+	if (tool.name === LOADER_TOOL_NAME) {
+		return "按需工具调度器：根据任务由模型在对话中自动唤醒未激活的扩展工具。";
+	}
+	const desc = tool.description ? firstSentence(tool.description) : "";
+	return desc || "（该工具暂无详细描述）";
+}
+
+function formatToolSource(tool: ToolInfo): string {
+	if (tool.name === LOADER_TOOL_NAME) {
+		return "按需调度器 (核心常驻)";
+	}
+	if (isBuiltin(tool)) {
+		return "内置核心工具";
+	}
+	const raw = tool.sourceInfo?.source || "";
+	if (raw.startsWith("npm:")) {
+		return raw.slice(4);
+	}
+	if (raw.includes("/")) {
+		const parts = raw.split("/").filter(Boolean);
+		return parts[parts.length - 1] || raw;
+	}
+	return raw || "扩展插件";
+}
+
+function sortTools(tools: ToolInfo[]): ToolInfo[] {
+	return [...tools].sort((a, b) => {
+		const orderA = isBuiltin(a) ? 0 : a.name === LOADER_TOOL_NAME ? 1 : 2;
+		const orderB = isBuiltin(b) ? 0 : b.name === LOADER_TOOL_NAME ? 1 : 2;
+		if (orderA !== orderB) return orderA - orderB;
+		return a.name.localeCompare(b.name);
+	});
 }
 
 export default function toolsExtension(pi: ExtensionAPI) {
@@ -295,67 +330,151 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			}
 
 			allTools = pi.getAllTools();
-			const availableTools = allTools.filter(isSupported);
+			const availableTools = sortTools(allTools.filter(isSupported));
+			const totalItems = availableTools.length;
+			let selectedIndex = 0;
+			const maxVisible = Math.max(10, Math.min(totalItems, 16));
 
 			await ctx.ui.custom((tui, theme, _kb, done) => {
-				const items: SettingItem[] = availableTools.map((tool) => ({
-					id: tool.name,
-					label: tool.name === LOADER_TOOL_NAME ? `${tool.name} (auto-loader)` : tool.name,
-					currentValue: enabledTools.has(tool.name) ? "enabled" : "disabled",
-					values: ["enabled", "disabled"],
-				}));
-
-				const container = new Container();
-				container.addChild(
-					new (class {
-						render(_width: number) {
-							return [
-								theme.fg("accent", theme.bold("Tool Configuration")),
-								theme.fg("muted", "开关当前会话。非内置的选择记成以后新会话默认；内置只影响本场。enable_tool 不能关。"),
-								"",
-							];
-						}
-						invalidate() {}
-					})(),
-				);
-
-				const settingsList = new SettingsList(
-					items,
-					Math.min(items.length + 3, 16),
-					getSettingsListTheme(),
-					(id, newValue) => {
-						if (id === LOADER_TOOL_NAME) {
-							enabledTools.add(LOADER_TOOL_NAME);
-							replaceActiveTools();
-							persistSession();
-							return;
-						}
-						if (newValue === "enabled") {
-							enabledTools.add(id);
-						} else {
-							enabledTools.delete(id);
-						}
-						replaceActiveTools();
-						persistSession();
-						persistExtensionDefault(id);
-					},
-					() => {
-						done(undefined);
-					},
-				);
-
-				container.addChild(settingsList);
-
 				return {
 					render(width: number) {
-						return container.render(width);
+						const lines: string[] = [];
+
+						// 1. 标题与说明（固定 3 行）
+						lines.push(theme.fg("accent", theme.bold("Tool Configuration")));
+						lines.push(theme.fg("muted", "开关当前会话。非内置选择存为以后默认，内置只影响本场。"));
+						lines.push("");
+
+						// 2. 列表项滚动可视窗口（固定 maxVisible 行）
+						const visibleCount = Math.min(totalItems, maxVisible);
+						const startIndex = Math.max(
+							0,
+							Math.min(selectedIndex - Math.floor(visibleCount / 2), totalItems - visibleCount),
+						);
+						const endIndex = startIndex + visibleCount;
+
+						const maxNameLen = Math.min(
+							26,
+							Math.max(16, ...availableTools.map((t) => visibleWidth(t.name))),
+						);
+
+						for (let i = startIndex; i < endIndex; i++) {
+							const tool = availableTools[i];
+							if (!tool) continue;
+
+							const isSelected = i === selectedIndex;
+							const isLoader = tool.name === LOADER_TOOL_NAME;
+							const isAct = enabledTools.has(tool.name);
+
+							const cursor = isSelected ? theme.fg("accent", "→ ") : "  ";
+							const dot = isLoader
+								? theme.fg("accent", "● ")
+								: isAct
+									? theme.fg("success", "● ")
+									: theme.fg("dim", "○ ");
+
+							const nameWidth = visibleWidth(tool.name);
+							const pad = " ".repeat(Math.max(0, maxNameLen - nameWidth + 2));
+							const nameText = isSelected
+								? theme.bold(theme.fg("accent", tool.name))
+								: tool.name;
+
+							let badgeText: string;
+							if (isLoader) {
+								badgeText = theme.fg("accent", "[core]   ");
+							} else if (isBuiltin(tool)) {
+								badgeText = theme.fg("muted", "[builtin]");
+							} else {
+								badgeText = theme.fg("warning", "[user]   ");
+							}
+
+							let statusText: string;
+							if (isLoader) {
+								statusText = theme.fg("accent", "always on");
+							} else if (isAct) {
+								statusText = theme.fg("success", "enabled  ");
+							} else {
+								statusText = theme.fg("dim", "disabled ");
+							}
+
+							const row = `${cursor}${dot}${nameText}${pad} ${badgeText}  ${statusText}`;
+							lines.push(truncateToWidth(row, width));
+						}
+
+						// 补齐空白行（保证列表区域行数固定）
+						for (let k = visibleCount; k < maxVisible; k++) {
+							lines.push("");
+						}
+
+						// 3. 滚动进度指示行（固定 1 行）
+						if (totalItems > maxVisible) {
+							lines.push(theme.fg("dim", `  (${selectedIndex + 1}/${totalItems})`));
+						} else {
+							lines.push("");
+						}
+
+						// 4. 分割线（固定 1 行）
+						lines.push(theme.fg("dim", "─".repeat(Math.min(width, 70))));
+
+						// 5. 详情描述与来源卡片（固定 2 行）
+						const currentTool = availableTools[selectedIndex];
+						if (currentTool) {
+							const desc = formatToolDescription(currentTool);
+							const src = formatToolSource(currentTool);
+							lines.push(truncateToWidth(`  说明: ${theme.fg("accent", desc)}`, width));
+							lines.push(truncateToWidth(`  来源: ${theme.fg("muted", src)}`, width));
+						} else {
+							lines.push("");
+							lines.push("");
+						}
+
+						// 6. 空行（固定 1 行）
+						lines.push("");
+
+						// 7. 底部操作提示（固定 1 行）
+						lines.push(
+							truncateToWidth(
+								theme.fg("muted", "  ↑/↓: 移动光标  ·  Space/Enter: 切换状态  ·  Esc: 保存退出"),
+								width,
+							),
+						);
+
+						return lines;
 					},
-					invalidate() {
-						container.invalidate();
-					},
+					invalidate() {},
 					handleInput(data: string) {
-						settingsList.handleInput?.(data);
-						tui.requestRender();
+						const kb = getKeybindings();
+						if (kb.matches(data, "tui.select.up") || data === "k" || data === "\u001b[A") {
+							if (totalItems === 0) return;
+							selectedIndex = selectedIndex === 0 ? totalItems - 1 : selectedIndex - 1;
+							tui.requestRender();
+						} else if (kb.matches(data, "tui.select.down") || data === "j" || data === "\u001b[B") {
+							if (totalItems === 0) return;
+							selectedIndex = selectedIndex === totalItems - 1 ? 0 : selectedIndex + 1;
+							tui.requestRender();
+						} else if (kb.matches(data, "tui.select.pageUp")) {
+							selectedIndex = Math.max(0, selectedIndex - 8);
+							tui.requestRender();
+						} else if (kb.matches(data, "tui.select.pageDown")) {
+							selectedIndex = Math.min(totalItems - 1, selectedIndex + 8);
+							tui.requestRender();
+						} else if (kb.matches(data, "tui.select.confirm") || data === " ") {
+							const tool = availableTools[selectedIndex];
+							if (tool && tool.name !== LOADER_TOOL_NAME) {
+								const id = tool.name;
+								if (enabledTools.has(id)) {
+									enabledTools.delete(id);
+								} else {
+									enabledTools.add(id);
+								}
+								replaceActiveTools();
+								persistSession();
+								persistExtensionDefault(id);
+							}
+							tui.requestRender();
+						} else if (kb.matches(data, "tui.select.cancel") || data === "q" || data === "\u001b") {
+							done(undefined);
+						}
 					},
 				};
 			});
