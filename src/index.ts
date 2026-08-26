@@ -74,13 +74,48 @@ function saveDefaultEnabled(names: string[]) {
 function catalogFrom(tools: ToolInfo[]): CatalogEntry[] {
 	return tools.filter(isOnDemand).map((tool) => ({
 		name: tool.name,
-		blurb: firstSentence(tool.description).slice(0, 80) || tool.name,
+		blurb: firstSentence(tool.description).slice(0, 60).replace(/[。.]\s*$/, "").trim() || tool.name,
 	}));
+}
+
+/** 同一工具开再关视为无变化；只保留奇数次切换后的最终状态。 */
+function netToolToggles(
+	changes: { name: string; enabled: boolean }[],
+): { name: string; enabled: boolean }[] {
+	const last = new Map<string, boolean>();
+	const times = new Map<string, number>();
+	for (const change of changes) {
+		last.set(change.name, change.enabled);
+		times.set(change.name, (times.get(change.name) ?? 0) + 1);
+	}
+	const net: { name: string; enabled: boolean }[] = [];
+	for (const [name, enabled] of last) {
+		if ((times.get(name) ?? 0) % 2 === 1) {
+			net.push({ name, enabled });
+		}
+	}
+	return net;
+}
+
+function toolsUpdateNotice(changes: { name: string; enabled: boolean }[]): string {
+	const enabled = changes.filter((c) => c.enabled).map((c) => c.name);
+	const disabled = changes.filter((c) => !c.enabled).map((c) => c.name);
+	const parts: string[] = [];
+	if (enabled.length > 0) {
+		parts.push(
+			`User enabled: ${enabled.join(", ")}. These tools are already active; do not call enable_tool for them.`,
+		);
+	}
+	if (disabled.length > 0) {
+		parts.push(`User disabled: ${disabled.join(", ")}. Do not call these tools.`);
+	}
+	return `<tools_update>${parts.join(" ")}</tools_update>`;
 }
 
 export default function toolsExtension(pi: ExtensionAPI) {
 	let enabledTools: Set<string> = new Set();
 	let allTools: ToolInfo[] = [];
+	let pendingContextNotice = "";
 
 	function persistSession() {
 		pi.appendEntry<ToolsState>("tools-config", {
@@ -205,13 +240,13 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			name: LOADER_TOOL_NAME,
 			label: "Enable Tool",
 			description: hasCatalog
-				? `按精确名或任务关键词激活未启用的工具。按需工具：${blurbs}。激活后完整参数 schema 只在下一轮模型请求可用，不要在同一条 assistant 消息里调用它们。`
-				: "按精确名或任务关键词激活当前未启用的工具。激活后完整参数 schema 只在下一轮模型请求可用，不要在同一条 assistant 消息里调用它们。",
-			promptSnippet: "按精确名激活未启用的工具",
+				? `按精确名激活未启用的扩展工具。按需工具列表：${blurbs}。激活后参数在下一轮生效，禁止同轮连调。`
+				: "按精确名或任务关键词激活未启用的扩展工具。激活后参数在下一轮生效，禁止同轮连调。",
+			promptSnippet: "按精确名激活未启用的扩展工具",
 			promptGuidelines: [
 				hasCatalog
-					? `需要的工具如果未激活，先调用 enable_tool，tool_names 传精确名（${names}）。新工具只在下一轮请求可用，禁止与 enable_tool 同轮并行调用。`
-					: "需要的工具如果未激活，先调用 enable_tool（精确名或 query）。新工具只在下一轮请求可用，禁止与 enable_tool 同轮并行调用。",
+					? `需要的扩展工具未激活时，先调用 enable_tool，tool_names 传精确名（${names}）。新工具下一轮生效，禁止同轮连调。`
+					: "需要的扩展工具未激活时，先调用 enable_tool（精确名或 query）。新工具下一轮生效，禁止同轮连调。",
 			],
 			parameters: Type.Object({
 				tool_names: Type.Optional(Type.Array(Type.String(), {
@@ -286,6 +321,7 @@ export default function toolsExtension(pi: ExtensionAPI) {
 
 			allTools = pi.getAllTools();
 			const tools = sortTools(allTools.filter(isSupported));
+			const toggledChanges: { name: string; enabled: boolean }[] = [];
 			await ctx.ui.custom((tui, theme, kb, done) =>
 				createToolsPanel({
 					tui,
@@ -295,15 +331,50 @@ export default function toolsExtension(pi: ExtensionAPI) {
 					tools,
 					enabled: enabledTools,
 					onToggle(id) {
-						if (enabledTools.has(id)) enabledTools.delete(id);
-						else enabledTools.add(id);
+						if (enabledTools.has(id)) {
+							enabledTools.delete(id);
+							toggledChanges.push({ name: id, enabled: false });
+						} else {
+							enabledTools.add(id);
+							toggledChanges.push({ name: id, enabled: true });
+						}
 						replaceActiveTools();
 						persistSession();
 						persistExtensionDefault(id);
 					},
 				}),
 			);
+			const net = netToolToggles(toggledChanges);
+			if (net.length > 0) {
+				pendingContextNotice = toolsUpdateNotice(net);
+			}
 		},
+	});
+
+	// /tools 关掉后，下一次 LLM 请求塞一条一次性通知：不写 session、不改 system prompt。
+	pi.on("context", (event) => {
+		if (!pendingContextNotice) return;
+		const notice = pendingContextNotice;
+		pendingContextNotice = "";
+		try {
+			const messages = event.messages;
+			const injected = {
+				role: "user" as const,
+				content: notice,
+				timestamp: Date.now(),
+			};
+			let insertAt = messages.length;
+			for (let i = messages.length - 1; i >= 0; i--) {
+				if (messages[i]?.role === "user") {
+					insertAt = i;
+					break;
+				}
+			}
+			messages.splice(insertAt, 0, injected);
+			return { messages };
+		} catch {
+			pendingContextNotice = notice;
+		}
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
