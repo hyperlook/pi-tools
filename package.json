@@ -21,6 +21,10 @@
     "src",
     "README.md"
   ],
+  "scripts": {
+    "test": "bun test",
+    "check": "bun x tsc --noEmit"
+  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.86.0",
     "@earendil-works/pi-tui": "^0.86.0",

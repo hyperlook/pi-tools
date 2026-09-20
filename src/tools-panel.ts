@@ -1,6 +1,7 @@
 import type { KeybindingsManager, Theme, ThemeColor, ToolInfo } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { ConfigScope } from "./config.ts";
 import { firstSentence, toolKind, type ToolKind } from "./shared.ts";
 
 const KIND_ORDER: Record<ToolKind, number> = { builtin: 0, loader: 1, user: 2 };
@@ -78,7 +79,7 @@ function rowView(theme: Theme, tool: ToolInfo, selected: boolean, enabled: boole
 	};
 }
 
-type PanelAction = "up" | "down" | "pageUp" | "pageDown" | "toggle" | "quit";
+type PanelAction = "up" | "down" | "pageUp" | "pageDown" | "toggle" | "toggleScope" | "quit";
 
 function readAction(kb: KeybindingsManager, data: string): PanelAction | undefined {
 	if (kb.matches(data, "tui.select.up") || data === "k") return "up";
@@ -86,23 +87,46 @@ function readAction(kb: KeybindingsManager, data: string): PanelAction | undefin
 	if (kb.matches(data, "tui.select.pageUp")) return "pageUp";
 	if (kb.matches(data, "tui.select.pageDown")) return "pageDown";
 	if (kb.matches(data, "tui.select.confirm") || data === " ") return "toggle";
+	if (matchesKey(data, Key.tab) || data === "\t") return "toggleScope";
 	if (kb.matches(data, "tui.select.cancel") || data === "q") return "quit";
 }
 
-export function createToolsPanel(opts: {
+export interface ToolsPanelOptions {
 	tui: TUI;
 	theme: Theme;
 	kb: KeybindingsManager;
 	done: (value: undefined) => void;
 	tools: ToolInfo[];
 	enabled: Set<string>;
-	onToggle: (id: string) => void;
-}) {
-	const { tui, theme, kb, done, tools, enabled, onToggle } = opts;
+	initialScope: ConfigScope;
+	canUseProjectScope: boolean;
+	projectDisplayPath: string;
+	globalDisplayPath: string;
+	isEnvOverridden?: boolean;
+	onToggle: (id: string, scope: ConfigScope) => void;
+}
+
+export function createToolsPanel(opts: ToolsPanelOptions) {
+	const {
+		tui,
+		theme,
+		kb,
+		done,
+		tools,
+		enabled,
+		initialScope,
+		canUseProjectScope,
+		projectDisplayPath,
+		globalDisplayPath,
+		isEnvOverridden,
+		onToggle,
+	} = opts;
+
 	const total = tools.length;
 	const listH = Math.max(LIST_MIN, Math.min(total, LIST_MAX));
 	const nameCol = Math.min(NAME_MAX, Math.max(NAME_MIN, ...tools.map((tool) => visibleWidth(tool.name))));
 	let selected = 0;
+	let currentScope: ConfigScope = initialScope;
 
 	return {
 		render(width: number) {
@@ -128,19 +152,42 @@ export function createToolsPanel(opts: {
 				]
 				: ["", ""];
 
+			let scopeTag: string;
+			let scopeDesc: string;
+
+			if (isEnvOverridden) {
+				scopeTag = theme.fg("warning", `[Env: ${globalDisplayPath}]`);
+				scopeDesc = "当前由 PI_TOOLS_CONFIG 环境变量直接接管配置";
+			} else if (currentScope === "project") {
+				scopeTag = theme.fg("accent", theme.bold(`[Project: ${projectDisplayPath}]`));
+				scopeDesc = `开关存入当前项目 · 按 Tab 切为全局 (${globalDisplayPath})`;
+			} else {
+				scopeTag = theme.fg("muted", theme.bold(`[Global: ${globalDisplayPath}]`));
+				scopeDesc = canUseProjectScope
+					? `开关存入全局默认 · 按 Tab 切为项目 (${projectDisplayPath})`
+					: "开关存入全局默认（当前项目未受信任，不可使用项目级配置）";
+			}
+
+			const headerLine = truncateToWidth(
+				`${theme.fg("accent", theme.bold("Tool Configuration"))}  ${scopeTag}`,
+				width,
+			);
+			const subLine = truncateToWidth(theme.fg("muted", scopeDesc), width);
+
+			const footerHints = isEnvOverridden || !canUseProjectScope
+				? "  ↑/↓: 移动光标  ·  Space/Enter: 切换状态  ·  Esc: 保存退出"
+				: "  ↑/↓: 移动光标  ·  Space/Enter: 切换  ·  Tab: 切换作用域  ·  Esc: 保存退出";
+
 			return [
-				theme.fg("accent", theme.bold("Tool Configuration")),
-				theme.fg("muted", "开关当前会话。非内置选择存为以后默认，内置只影响本场。"),
+				headerLine,
+				subLine,
 				"",
 				...list,
 				total > listH ? theme.fg("dim", `  (${selected + 1}/${total})`) : "",
 				theme.fg("dim", "─".repeat(Math.min(width, DIVIDER_MAX))),
 				...detail,
 				"",
-				truncateToWidth(
-					theme.fg("muted", "  ↑/↓: 移动光标  ·  Space/Enter: 切换状态  ·  Esc: 保存退出"),
-					width,
-				),
+				truncateToWidth(theme.fg("muted", footerHints), width),
 			];
 		},
 		invalidate() {},
@@ -151,6 +198,15 @@ export function createToolsPanel(opts: {
 				done(undefined);
 				return;
 			}
+
+			if (action === "toggleScope") {
+				if (!isEnvOverridden && canUseProjectScope) {
+					currentScope = currentScope === "global" ? "project" : "global";
+					tui.requestRender();
+				}
+				return;
+			}
+
 			if (total === 0) return;
 
 			if (action === "up") selected = selected === 0 ? total - 1 : selected - 1;
@@ -159,7 +215,9 @@ export function createToolsPanel(opts: {
 			else if (action === "pageDown") selected = Math.min(total - 1, selected + PAGE_SIZE);
 			else if (action === "toggle") {
 				const tool = tools[selected];
-				if (tool && toolKind(tool) !== "loader") onToggle(tool.name);
+				if (tool && toolKind(tool) !== "loader") {
+					onToggle(tool.name, currentScope);
+				}
 			}
 			tui.requestRender();
 		},
