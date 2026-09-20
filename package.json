@@ -1,6 +1,6 @@
 {
   "name": "pi-tools",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Pi 按需启用工具：开场扫描扩展工具写入 enable_tool 目录，人用 /tools 记非内置默认，模型用 enable_tool 只改当前会话",
   "type": "module",
   "main": "src/index.ts",
@@ -22,8 +22,8 @@
     "README.md"
   ],
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.3",
-    "@earendil-works/pi-tui": "^0.80.3",
+    "@earendil-works/pi-coding-agent": "^0.86.0",
+    "@earendil-works/pi-tui": "^0.86.0",
     "@types/node": "^25.9.1",
     "typebox": "^1.1.38",
     "typescript": "^6.0.3"
@@ -34,8 +34,8 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.80.3",
-    "@earendil-works/pi-tui": ">=0.80.3",
+    "@earendil-works/pi-coding-agent": ">=0.86.0",
+    "@earendil-works/pi-tui": ">=0.86.0",
     "typebox": "*"
   }
 }

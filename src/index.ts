@@ -1,13 +1,12 @@
 /**
  * 按需启用工具：
- * 1. 会话开始扫一遍已注册工具。目录是开场快照，不是当前失活名单。
- * 2. 人用 /tools：当前会话立刻生效；非内置的开集记成以后新会话的默认。
- * 3. 模型用 enable_tool：只改当前会话，不改默认。
- * 4. 按需目录写在 enable_tool 的 description / guidelines 里，会话内字节不变。
- * 5. 当前会话的选择跟分支走。
- *
- * 不要在 before_agent_start 里按「当前未激活集合」改 system prompt：
- * 激活工具后那段会变短，前缀缓存必 miss。
+ * 1. 会话开始扫描本机已注册工具，生成按需工具目录并注册 enable_tool 调度器。
+ * 2. 人用 /tools：即时切换工具。非内置工具写入用户偏好；当前会话调用 pi.setActiveTools()。
+ * 3. 模型用 enable_tool：当前会话增量激活工具，同样通过 pi.setActiveTools() 生效。
+ * 4. Pi 0.86+ 原生支持 Transcript-aware mid-conversation updates：
+ *    工具发生变动时，Pi 自动对 system prompt sections (tools/rules) 做增量 diff 并注入
+ *    轻量级系统补丁消息（patch），不再全量重写 System Prompt，原生保住前缀缓存（Prompt Cache）。
+ * 5. 当前会话的选择与分支严格绑定，切换分支或恢复会话自动同步。
  */
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -78,44 +77,9 @@ function catalogFrom(tools: ToolInfo[]): CatalogEntry[] {
 	}));
 }
 
-/** 同一工具开再关视为无变化；只保留奇数次切换后的最终状态。 */
-function netToolToggles(
-	changes: { name: string; enabled: boolean }[],
-): { name: string; enabled: boolean }[] {
-	const last = new Map<string, boolean>();
-	const times = new Map<string, number>();
-	for (const change of changes) {
-		last.set(change.name, change.enabled);
-		times.set(change.name, (times.get(change.name) ?? 0) + 1);
-	}
-	const net: { name: string; enabled: boolean }[] = [];
-	for (const [name, enabled] of last) {
-		if ((times.get(name) ?? 0) % 2 === 1) {
-			net.push({ name, enabled });
-		}
-	}
-	return net;
-}
-
-function toolsUpdateNotice(changes: { name: string; enabled: boolean }[]): string {
-	const enabled = changes.filter((c) => c.enabled).map((c) => c.name);
-	const disabled = changes.filter((c) => !c.enabled).map((c) => c.name);
-	const parts: string[] = [];
-	if (enabled.length > 0) {
-		parts.push(
-			`User enabled: ${enabled.join(", ")}. These tools are already active; do not call enable_tool for them.`,
-		);
-	}
-	if (disabled.length > 0) {
-		parts.push(`User disabled: ${disabled.join(", ")}. Do not call these tools.`);
-	}
-	return `<tools_update>${parts.join(" ")}</tools_update>`;
-}
-
 export default function toolsExtension(pi: ExtensionAPI) {
 	let enabledTools: Set<string> = new Set();
 	let allTools: ToolInfo[] = [];
-	let pendingContextNotice = "";
 
 	function persistSession() {
 		pi.appendEntry<ToolsState>("tools-config", {
@@ -321,7 +285,6 @@ export default function toolsExtension(pi: ExtensionAPI) {
 
 			allTools = pi.getAllTools();
 			const tools = sortTools(allTools.filter(isSupported));
-			const toggledChanges: { name: string; enabled: boolean }[] = [];
 			await ctx.ui.custom((tui, theme, kb, done) =>
 				createToolsPanel({
 					tui,
@@ -333,10 +296,8 @@ export default function toolsExtension(pi: ExtensionAPI) {
 					onToggle(id) {
 						if (enabledTools.has(id)) {
 							enabledTools.delete(id);
-							toggledChanges.push({ name: id, enabled: false });
 						} else {
 							enabledTools.add(id);
-							toggledChanges.push({ name: id, enabled: true });
 						}
 						replaceActiveTools();
 						persistSession();
@@ -344,37 +305,7 @@ export default function toolsExtension(pi: ExtensionAPI) {
 					},
 				}),
 			);
-			const net = netToolToggles(toggledChanges);
-			if (net.length > 0) {
-				pendingContextNotice = toolsUpdateNotice(net);
-			}
 		},
-	});
-
-	// /tools 关掉后，下一次 LLM 请求塞一条一次性通知：不写 session、不改 system prompt。
-	pi.on("context", (event) => {
-		if (!pendingContextNotice) return;
-		const notice = pendingContextNotice;
-		pendingContextNotice = "";
-		try {
-			const messages = event.messages;
-			const injected = {
-				role: "user" as const,
-				content: notice,
-				timestamp: Date.now(),
-			};
-			let insertAt = messages.length;
-			for (let i = messages.length - 1; i >= 0; i--) {
-				if (messages[i]?.role === "user") {
-					insertAt = i;
-					break;
-				}
-			}
-			messages.splice(insertAt, 0, injected);
-			return { messages };
-		} catch {
-			pendingContextNotice = notice;
-		}
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
