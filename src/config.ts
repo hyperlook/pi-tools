@@ -60,6 +60,14 @@ export function writeConfigFile(filePath: string, names: string[]): void {
 	);
 }
 
+export function readScopeConfig(scope: ConfigScope, cwd: string): string[] | undefined {
+	if (process.env.PI_TOOLS_CONFIG) {
+		return readConfigFile(process.env.PI_TOOLS_CONFIG);
+	}
+	const targetPath = scope === "project" ? getProjectConfigPath(cwd) : getGlobalConfigPath();
+	return readConfigFile(targetPath);
+}
+
 /**
  * 解析当前生效的配置：
  * 1. 若设置了 PI_TOOLS_CONFIG，使用环境变量路径（视为 global/override）
@@ -106,9 +114,11 @@ export function resolveEffectiveConfig(cwd: string, isProjectTrusted: boolean): 
 
 /**
  * 将某个工具的开关状态持久化到目标 Scope：
- * - targetScope === "project"：写入 <cwd>/.pi/pi-tools.json。若此前无项目配置，以全局配置为基底派生。
- * - targetScope === "global"：写入全局配置。
- * 遵循原则：仅根据人类刚拨动的这一个工具变更，避免将模型临时唤醒的工具连带持久化。
+ * - targetScope === "project"：写入 <cwd>/.pi/pi-tools.json
+ * - targetScope === "global"：写入 ~/.pi/agent/pi-tools.json
+ * 纯白名单原则：
+ * 1. 仅对扩展工具与调度器生效，系统内置核心工具绝对拦截。
+ * 2. 真实读取目标作用域配置（若此前无配置，则以空基底 [] 派生，绝无暗箱兜底）。
  */
 export function persistToolPreference(options: {
 	toolName: string;
@@ -121,21 +131,17 @@ export function persistToolPreference(options: {
 	if (!knownTools.has(toolName)) return;
 
 	let targetPath: string;
-	let baseList: string[] | undefined;
-
 	if (process.env.PI_TOOLS_CONFIG) {
 		targetPath = process.env.PI_TOOLS_CONFIG;
-		baseList = readConfigFile(targetPath) ?? [];
 	} else if (targetScope === "project") {
 		targetPath = getProjectConfigPath(cwd);
-		// 项目优先读取自身；若首次建立项目配置，以全局配置为初始基底派生
-		baseList = readConfigFile(targetPath) ?? readConfigFile(getGlobalConfigPath()) ?? [];
 	} else {
 		targetPath = getGlobalConfigPath();
-		baseList = readConfigFile(targetPath) ?? [];
 	}
 
+	const baseList = readConfigFile(targetPath) ?? [];
 	const set = new Set(baseList);
+
 	if (enabled) {
 		set.add(toolName);
 	} else {

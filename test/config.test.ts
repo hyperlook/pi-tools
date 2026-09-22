@@ -4,13 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	formatDisplayPath,
+	getGlobalConfigPath,
 	getProjectConfigPath,
 	hasProjectConfig,
 	persistToolPreference,
 	readConfigFile,
+	readScopeConfig,
 	resolveEffectiveConfig,
 	writeConfigFile,
 } from "../src/config.ts";
+import { LOADER_TOOL_NAME } from "../src/shared.ts";
 
 describe("config tests", () => {
 	let testDir: string;
@@ -99,15 +102,12 @@ describe("config tests", () => {
 		expect(res.isEnvOverridden).toBe(true);
 	});
 
-	it("persists tool preference to project scope deriving from global if new", () => {
-		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, ["tool_a", "tool_b"]);
+	it("creates pure allowlist without injecting surprise tools when no config exists", () => {
+		const known = new Set([LOADER_TOOL_NAME, "web_search"]);
 
-		const known = new Set(["tool_a", "tool_b", "tool_c"]);
-
-		// Project config does not exist yet. Toggling tool_c on in project scope:
+		// Neither project nor global config exists
 		persistToolPreference({
-			toolName: "tool_c",
+			toolName: "web_search",
 			enabled: true,
 			targetScope: "project",
 			cwd: projectDir,
@@ -116,10 +116,8 @@ describe("config tests", () => {
 
 		const projPath = getProjectConfigPath(projectDir);
 		expect(existsSync(projPath)).toBe(true);
-		expect(readConfigFile(projPath)).toEqual(["tool_a", "tool_b", "tool_c"]);
-
-		// Global config should remain untouched
-		expect(readConfigFile(globalPath)).toEqual(["tool_a", "tool_b"]);
+		// Must only contain web_search, never magically auto-enable enable_tool
+		expect(readConfigFile(projPath)).toEqual(["web_search"]);
 	});
 
 	it("allows project to explicitly disable all extension tools with empty array", () => {
@@ -167,5 +165,47 @@ describe("config tests", () => {
 
 		expect(readConfigFile(projPath)).toEqual(["custom_tool_1", "custom_tool_2"]);
 		expect(readConfigFile(globalPath)).toEqual(["web_search"]);
+	});
+
+	it("refuses to persist builtin tools that are not in knownTools", () => {
+		const globalPath = join(globalDir, "pi-tools.json");
+		writeConfigFile(globalPath, [LOADER_TOOL_NAME]);
+
+		const known = new Set([LOADER_TOOL_NAME, "web_search"]);
+
+		persistToolPreference({
+			toolName: "bash",
+			enabled: false,
+			targetScope: "global",
+			cwd: projectDir,
+			knownTools: known,
+		});
+
+		expect(readConfigFile(globalPath)).toEqual([LOADER_TOOL_NAME]);
+	});
+
+	it("allows disabling enable_tool in defaultEnabled", () => {
+		const globalPath = join(globalDir, "pi-tools.json");
+		writeConfigFile(globalPath, [LOADER_TOOL_NAME, "web_search"]);
+
+		const known = new Set([LOADER_TOOL_NAME, "web_search"]);
+
+		persistToolPreference({
+			toolName: LOADER_TOOL_NAME,
+			enabled: false,
+			targetScope: "global",
+			cwd: projectDir,
+			knownTools: known,
+		});
+
+		expect(readConfigFile(globalPath)).toEqual(["web_search"]);
+	});
+
+	it("reads scope config accurately using readScopeConfig", () => {
+		const projPath = getProjectConfigPath(projectDir);
+		writeConfigFile(projPath, ["project_tool"]);
+
+		expect(readScopeConfig("project", projectDir)).toEqual(["project_tool"]);
+		expect(readScopeConfig("global", projectDir)).toBeUndefined();
 	});
 });

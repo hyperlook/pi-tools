@@ -1,12 +1,8 @@
 /**
- * 按需启用工具：
- * 1. 会话开始扫描本机已注册工具，生成按需工具目录并注册 enable_tool 调度器。
- * 2. 人用 /tools：即时切换工具。非内置工具写入项目或全局偏好；当前会话调用 pi.setActiveTools()。
- * 3. 模型用 enable_tool：当前会话增量激活工具，同样通过 pi.setActiveTools() 生效。
- * 4. Pi 0.86+ 原生支持 Transcript-aware mid-conversation updates：
- *    工具发生变动时，Pi 自动对 system prompt sections (tools/rules) 做增量 diff 并注入
- *    轻量级系统补丁消息（patch），不再全量重写 System Prompt，原生保住前缀缓存（Prompt Cache）。
- * 5. 当前会话的选择与分支严格绑定，切换分支或恢复会话自动同步。
+ * pi-tools: 按需启用扩展工具（终极纯白名单方案）
+ * 1. 系统内置工具归官方（Zero Blast Radius）：彻底不碰、不持久化，面板变灰只读。
+ * 2. 扩展工具与调度器收敛为纯白名单：唯一字段 defaultEnabled，无配置则全关，按需在面板配置点亮。
+ * 3. 安全沙箱无越权风险：调度池仅包含扩展工具，模型绝无法越权自激活内置核心工具。
  */
 
 import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
@@ -15,17 +11,24 @@ import {
 	formatDisplayPath,
 	getGlobalConfigPath,
 	persistToolPreference,
+	readScopeConfig,
 	resolveEffectiveConfig,
 	type ConfigScope,
 } from "./config.ts";
-import { firstSentence, isBuiltin, LOADER_TOOL_NAME } from "./shared.ts";
+import {
+	firstSentence,
+	isBuiltin,
+	isOnDemand,
+	isSupported,
+	LOADER_TOOL_NAME,
+} from "./shared.ts";
 import { createToolsPanel, sortTools } from "./tools-panel.ts";
 
-interface ToolsState {
+export interface ToolsState {
 	enabledTools: string[];
 }
 
-interface CatalogEntry {
+export interface CatalogEntry {
 	name: string;
 	blurb: string;
 }
@@ -33,24 +36,82 @@ interface CatalogEntry {
 const QUERY_MIN_TOKEN = 3;
 const QUERY_LIMIT = 5;
 
-function isSupported(toolOrName: ToolInfo | string): boolean {
-	const name = typeof toolOrName === "string" ? toolOrName : toolOrName.name;
-	if (name === "powershell" && process.platform !== "win32") {
-		return false;
-	}
-	return true;
-}
-
-/** 扩展工具：可挂起、进目录、可写成新会话默认。 */
-function isOnDemand(tool: ToolInfo): boolean {
-	return tool.name !== LOADER_TOOL_NAME && !isBuiltin(tool) && isSupported(tool);
-}
-
-function catalogFrom(tools: ToolInfo[]): CatalogEntry[] {
+export function catalogFrom(tools: ToolInfo[]): CatalogEntry[] {
 	return tools.filter(isOnDemand).map((tool) => ({
 		name: tool.name,
 		blurb: firstSentence(tool.description).slice(0, 60).replace(/[。.]\s*$/, "").trim() || tool.name,
 	}));
+}
+
+/**
+ * 确定新会话中应该激活的工具集合：
+ * 1. 内置核心工具：严格保留 Pi 启动时原生传入且受支持的内置工具，不多加、不少减。
+ * 2. 扩展工具 & 调度器：纯白名单！若配置文件存在，仅激活列在 defaultEnabled 中的工具；
+ *    若无任何配置文件（被删除或未配置），白名单为空，所有扩展工具与调度器均不激活。
+ */
+export function newSessionEnabled(
+	initialActiveTools: string[],
+	allTools: ToolInfo[],
+	cwd: string,
+	trusted: boolean,
+): Set<string> {
+	const toolMap = new Map(allTools.map((t) => [t.name, t]));
+	const next = new Set<string>();
+
+	// 1. 内置工具：保留 Pi 初始激活且受支持的内置核心工具
+	for (const name of initialActiveTools) {
+		const tool = toolMap.get(name);
+		if (tool && isBuiltin(tool) && isSupported(tool)) {
+			next.add(name);
+		}
+	}
+
+	// 2. 扩展工具 & 调度器：读取有效配置（纯白名单）
+	const config = resolveEffectiveConfig(cwd, trusted);
+	if (config.tools) {
+		for (const name of config.tools) {
+			const tool = toolMap.get(name);
+			if (name === LOADER_TOOL_NAME) {
+				next.add(LOADER_TOOL_NAME);
+			} else if (tool && isOnDemand(tool)) {
+				next.add(name);
+			}
+		}
+	}
+
+	return next;
+}
+
+/**
+ * 获取可被模型动态激活的未启用工具列表。
+ * 安全保障：调度池仅包含扩展工具，绝对排除内置核心工具及调度器自身。
+ */
+export function getInactiveTools(allTools: ToolInfo[], activeNames: string[]): ToolInfo[] {
+	return allTools.filter(
+		(t) => isOnDemand(t) && !activeNames.includes(t.name),
+	);
+}
+
+export function matchByQuery(inactive: ToolInfo[], query: string): ToolInfo[] {
+	const tokens = query
+		.toLowerCase()
+		.split(/[\s,._-]+/)
+		.filter((tok) => tok.length >= QUERY_MIN_TOKEN);
+	if (tokens.length === 0) return [];
+
+	return inactive
+		.map((tool) => {
+			const searchable = `${tool.name} ${tool.description || ""}`.toLowerCase();
+			const score = tokens.reduce(
+				(sum, tok) => sum + (searchable.includes(tok) ? 1 : 0),
+				0,
+			);
+			return { tool, score };
+		})
+		.filter((row) => row.score > 0)
+		.sort((a, b) => b.score - a.score)
+		.slice(0, QUERY_LIMIT)
+		.map((row) => row.tool);
 }
 
 export default function toolsExtension(pi: ExtensionAPI) {
@@ -65,60 +126,9 @@ export default function toolsExtension(pi: ExtensionAPI) {
 		});
 	}
 
-	/** 只把人刚拨的那一个扩展工具写入默认，不把模型 enable_tool 的结果带进去。 */
-	function persistExtensionDefault(id: string, scope: ConfigScope, cwd: string) {
-		const known = new Set(allTools.filter(isOnDemand).map((tool) => tool.name));
-		if (!known.has(id)) return;
-
-		persistToolPreference({
-			toolName: id,
-			enabled: enabledTools.has(id),
-			targetScope: scope,
-			cwd,
-			knownTools: known,
-		});
-	}
-
 	/** TUI / 会话恢复：整表替换。loader 执行期间不要走这条。 */
 	function replaceActiveTools() {
 		pi.setActiveTools(Array.from(enabledTools));
-	}
-
-	function newSessionEnabled(initialActiveTools: string[], cwd: string, trusted: boolean): Set<string> {
-		const toolMap = new Map(allTools.map((t) => [t.name, t]));
-		const next = new Set<string>();
-
-		// 1. 内置工具：只保留 Pi 启动时初始激活且当前平台支持的工具（如 read, bash, edit, write 或用户 settings.json defaultTools）
-		for (const name of initialActiveTools) {
-			const tool = toolMap.get(name);
-			if (tool && isBuiltin(tool) && isSupported(tool)) {
-				next.add(name);
-			}
-		}
-
-		// 容错兜底：若初始状态没有任何内置工具，保证最基本的读写与终端工具
-		if (next.size === 0) {
-			const standardBuiltins = ["read", "bash", "edit", "write"];
-			for (const name of standardBuiltins) {
-				const tool = toolMap.get(name);
-				if (tool && isSupported(tool)) next.add(name);
-			}
-		}
-
-		// 2. 扩展工具：解析有效配置（优先当前受信任项目的 .pi/pi-tools.json，回退到全局 ~/.pi/agent/pi-tools.json）
-		const config = resolveEffectiveConfig(cwd, trusted);
-		if (config.tools) {
-			for (const name of config.tools) {
-				const tool = toolMap.get(name);
-				if (tool && isOnDemand(tool)) {
-					next.add(name);
-				}
-			}
-		}
-
-		// 3. 调度器常驻
-		next.add(LOADER_TOOL_NAME);
-		return next;
 	}
 
 	function restoreFromBranch(ctx: ExtensionContext) {
@@ -144,41 +154,10 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			enabledTools = new Set(
 				savedTools.filter((t) => allToolNames.has(t) && isSupported(t)),
 			);
-			enabledTools.add(LOADER_TOOL_NAME);
 		} else {
-			enabledTools = newSessionEnabled(currentActive, currentCwd, isProjectTrusted);
+			enabledTools = newSessionEnabled(currentActive, allTools, currentCwd, isProjectTrusted);
 		}
 		replaceActiveTools();
-	}
-
-	function getInactiveTools(): ToolInfo[] {
-		allTools = pi.getAllTools();
-		const activeNames = pi.getActiveTools();
-		return allTools.filter(
-			(t) => t.name !== LOADER_TOOL_NAME && !activeNames.includes(t.name) && isSupported(t),
-		);
-	}
-
-	function matchByQuery(inactive: ToolInfo[], query: string): ToolInfo[] {
-		const tokens = query
-			.toLowerCase()
-			.split(/[\s,._-]+/)
-			.filter((tok) => tok.length >= QUERY_MIN_TOKEN);
-		if (tokens.length === 0) return [];
-
-		return inactive
-			.map((tool) => {
-				const searchable = `${tool.name} ${tool.description || ""}`.toLowerCase();
-				const score = tokens.reduce(
-					(sum, tok) => sum + (searchable.includes(tok) ? 1 : 0),
-					0,
-				);
-				return { tool, score };
-			})
-			.filter((row) => row.score > 0)
-			.sort((a, b) => b.score - a.score)
-			.slice(0, QUERY_LIMIT)
-			.map((row) => row.tool);
 	}
 
 	function registerLoader(catalog: CatalogEntry[]) {
@@ -206,7 +185,8 @@ export default function toolsExtension(pi: ExtensionAPI) {
 				})),
 			}),
 			async execute(_toolCallId, params) {
-				const inactive = getInactiveTools();
+				allTools = pi.getAllTools();
+				const inactive = getInactiveTools(allTools, pi.getActiveTools());
 				const toEnable: ToolInfo[] = [];
 
 				if (params.tool_names && params.tool_names.length > 0) {
@@ -242,7 +222,7 @@ export default function toolsExtension(pi: ExtensionAPI) {
 					.map((t) => t.name)
 					.filter((name) => !active.includes(name));
 				for (const name of added) enabledTools.add(name);
-				// 必须纯增量，Pi 才走 deferred loading / 前缀缓存。
+				// 增量激活，保持 Pi 的 transcript-aware 缓存优化
 				pi.setActiveTools([...new Set([...active, ...added])]);
 				persistSession();
 
@@ -278,6 +258,19 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			const projectDisplay = ".pi/pi-tools.json";
 			const globalDisplay = formatDisplayPath(getGlobalConfigPath());
 
+			// 当前在 Pi 中活跃的系统内置核心工具
+			const activeNames = new Set(pi.getActiveTools());
+			const activeBuiltinTools = new Set(
+				allTools
+					.filter((t) => isBuiltin(t) && activeNames.has(t.name))
+					.map((t) => t.name),
+			);
+
+			const getScopeEnabled = (scope: ConfigScope): Set<string> => {
+				const scopeConfig = readScopeConfig(scope, currentCwd);
+				return new Set(scopeConfig ?? []);
+			};
+
 			await ctx.ui.custom((tui, theme, kb, done) =>
 				createToolsPanel({
 					tui,
@@ -285,21 +278,41 @@ export default function toolsExtension(pi: ExtensionAPI) {
 					kb,
 					done,
 					tools,
-					enabled: enabledTools,
+					activeBuiltinTools,
 					initialScope,
 					canUseProjectScope: isProjectTrusted,
 					projectDisplayPath: projectDisplay,
 					globalDisplayPath: globalDisplay,
 					isEnvOverridden: effective.isEnvOverridden,
+					getScopeEnabled,
 					onToggle(id, scope) {
-						if (enabledTools.has(id)) {
-							enabledTools.delete(id);
-						} else {
-							enabledTools.add(id);
+						const currentScopeSet = getScopeEnabled(scope);
+						const nextEnabled = !currentScopeSet.has(id);
+						const known = new Set(
+							allTools
+								.filter((tool) => isOnDemand(tool) || tool.name === LOADER_TOOL_NAME)
+								.map((tool) => tool.name),
+						);
+
+						persistToolPreference({
+							toolName: id,
+							enabled: nextEnabled,
+							targetScope: scope,
+							cwd: currentCwd,
+							knownTools: known,
+						});
+
+						// 若修改的正好是当前生效的作用域，同步更新会话
+						const currentEffective = resolveEffectiveConfig(currentCwd, isProjectTrusted);
+						if (currentEffective.scope === scope) {
+							if (nextEnabled) {
+								enabledTools.add(id);
+							} else {
+								enabledTools.delete(id);
+							}
+							replaceActiveTools();
+							persistSession();
 						}
-						replaceActiveTools();
-						persistSession();
-						persistExtensionDefault(id, scope, currentCwd);
 					},
 				}),
 			);

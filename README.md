@@ -62,8 +62,8 @@ pi install git:github.com/hyperlook/pi-tools
 - **按 `Tab` 键切换保存目标（Scope）**：
   - **`[Project]`**：写入 `<cwd>/.pi/pi-tools.json`，仅在当前项目生效，便于随代码仓库共享。
   - **`[Global]`**：写入 `~/.pi/agent/pi-tools.json`，在所有未指定项目级配置的项目中作为默认值。
-- **内置核心工具**（如 `read`, `bash`, `edit`, `write`）的调整仅影响当前会话。
-- `enable_tool` 自身始终保持开启，不可禁用。
+- **内置核心工具**（如 `read`, `bash`, `edit`, `write`）：完全归 Pi 官方托管，在面板中**灰显锁定且只读**（标注 `pi native`），本插件彻底不碰、不改、不持久化，杜绝操作困惑与误触。
+- **按需调度器 `enable_tool` & 扩展工具**：纯白名单机制。按空格自由开/关并持久化到当前作用域（Project / Global）。当配置文件不存在或被删除时，白名单为空，没有任何扩展工具或调度器初始激活。
 
 ### 2. 模型自动激活
 当 LLM 发现当前激活的工具无法满足任务需求时，会主动调用 `enable_tool`：
@@ -118,12 +118,13 @@ pi install git:github.com/hyperlook/pi-tools
 ```json
 {
   "defaultEnabled": [
+    "enable_tool",
     "web_search",
     "url_context"
   ]
 }
 ```
-> 若某个项目需要保持零扩展工具纯净环境，项目配置可设为空数组：`{ "defaultEnabled": [] }`。
+> 若某个项目需要保持零扩展工具纯净沙箱环境，项目配置可设为空数组：`{ "defaultEnabled": [] }`（此时 `enable_tool` 亦被关闭，大模型无法自行激活任何扩展工具）。
 
 ## 开源协议
 
