@@ -8,11 +8,13 @@
 import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+	deleteProjectConfigFile,
 	formatDisplayPath,
 	getGlobalConfigPath,
-	persistToolPreference,
+	hasProjectConfig,
 	readScopeConfig,
 	resolveEffectiveConfig,
+	saveScopeConfig,
 	type ConfigScope,
 } from "./config.ts";
 import {
@@ -266,10 +268,13 @@ export default function toolsExtension(pi: ExtensionAPI) {
 					.map((t) => t.name),
 			);
 
-			const getScopeEnabled = (scope: ConfigScope): Set<string> => {
-				const scopeConfig = readScopeConfig(scope, currentCwd);
-				return new Set(scopeConfig ?? []);
-			};
+			const initialGlobalList = readScopeConfig("global", currentCwd);
+			const initialGlobalEnabled = new Set(initialGlobalList ?? []);
+
+			const initialProjectList = readScopeConfig("project", currentCwd);
+			const initialProjectEnabled = hasProjectConfig(currentCwd) && initialProjectList !== undefined
+				? new Set(initialProjectList)
+				: undefined;
 
 			await ctx.ui.custom((tui, theme, kb, done) =>
 				createToolsPanel({
@@ -284,35 +289,45 @@ export default function toolsExtension(pi: ExtensionAPI) {
 					projectDisplayPath: projectDisplay,
 					globalDisplayPath: globalDisplay,
 					isEnvOverridden: effective.isEnvOverridden,
-					getScopeEnabled,
-					onToggle(id, scope) {
-						const currentScopeSet = getScopeEnabled(scope);
-						const nextEnabled = !currentScopeSet.has(id);
+					initialGlobalEnabled,
+					initialProjectEnabled,
+					onSave(result) {
 						const known = new Set(
 							allTools
 								.filter((tool) => isOnDemand(tool) || tool.name === LOADER_TOOL_NAME)
 								.map((tool) => tool.name),
 						);
 
-						persistToolPreference({
-							toolName: id,
-							enabled: nextEnabled,
-							targetScope: scope,
+						// 1. 保存全局配置
+						saveScopeConfig({
+							scope: "global",
 							cwd: currentCwd,
+							names: Array.from(result.globalEnabled),
 							knownTools: known,
 						});
 
-						// 若修改的正好是当前生效的作用域，同步更新会话
-						const currentEffective = resolveEffectiveConfig(currentCwd, isProjectTrusted);
-						if (currentEffective.scope === scope) {
-							if (nextEnabled) {
-								enabledTools.add(id);
+						// 2. 保存项目配置（若未被环境变量锁定且受信任）
+						if (!effective.isEnvOverridden && isProjectTrusted) {
+							if (result.projectEnabled === undefined) {
+								// 项目选择恢复继承全局 -> 删除项目独立配置文件
+								deleteProjectConfigFile(currentCwd);
 							} else {
-								enabledTools.delete(id);
+								// 项目独立定制 -> 写入项目配置文件
+								saveScopeConfig({
+									scope: "project",
+									cwd: currentCwd,
+									names: Array.from(result.projectEnabled),
+									knownTools: known,
+								});
 							}
-							replaceActiveTools();
-							persistSession();
 						}
+
+						// 3. 重新同步当前生效会话工具
+						const currentActive = pi.getActiveTools();
+						enabledTools = newSessionEnabled(currentActive, allTools, currentCwd, isProjectTrusted);
+						replaceActiveTools();
+						persistSession();
+						ctx.ui.notify("工具配置已保存并生效", "info");
 					},
 				}),
 			);

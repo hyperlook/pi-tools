@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -110,6 +110,35 @@ export function resolveEffectiveConfig(cwd: string, isProjectTrusted: boolean): 
 		hasProjectConfig: projectExists,
 		isEnvOverridden: false,
 	};
+}
+
+export function deleteProjectConfigFile(cwd: string): boolean {
+	const projectPath = getProjectConfigPath(cwd);
+	if (existsSync(projectPath)) {
+		rmSync(projectPath, { force: true });
+		return true;
+	}
+	return false;
+}
+
+export function saveScopeConfig(options: {
+	scope: ConfigScope;
+	cwd: string;
+	names: string[];
+	knownTools: Set<string>;
+}): void {
+	const { scope, cwd, names, knownTools } = options;
+	let targetPath: string;
+	if (process.env.PI_TOOLS_CONFIG) {
+		targetPath = process.env.PI_TOOLS_CONFIG;
+	} else if (scope === "project") {
+		targetPath = getProjectConfigPath(cwd);
+	} else {
+		targetPath = getGlobalConfigPath();
+	}
+
+	const filtered = names.filter((name) => knownTools.has(name));
+	writeConfigFile(targetPath, filtered);
 }
 
 /**

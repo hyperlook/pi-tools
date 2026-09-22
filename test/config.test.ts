@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	deleteProjectConfigFile,
 	formatDisplayPath,
 	getGlobalConfigPath,
 	getProjectConfigPath,
@@ -11,6 +12,7 @@ import {
 	readConfigFile,
 	readScopeConfig,
 	resolveEffectiveConfig,
+	saveScopeConfig,
 	writeConfigFile,
 } from "../src/config.ts";
 import { LOADER_TOOL_NAME } from "../src/shared.ts";
@@ -207,5 +209,31 @@ describe("config tests", () => {
 
 		expect(readScopeConfig("project", projectDir)).toEqual(["project_tool"]);
 		expect(readScopeConfig("global", projectDir)).toBeUndefined();
+	});
+
+	it("deletes project config file when requested and returns status", () => {
+		const projPath = getProjectConfigPath(projectDir);
+		writeConfigFile(projPath, ["custom_tool"]);
+		expect(existsSync(projPath)).toBe(true);
+
+		const deleted = deleteProjectConfigFile(projectDir);
+		expect(deleted).toBe(true);
+		expect(existsSync(projPath)).toBe(false);
+
+		// Deleting again returns false
+		expect(deleteProjectConfigFile(projectDir)).toBe(false);
+	});
+
+	it("saves scope config with knownTools filtering applied", () => {
+		const known = new Set(["tool_a", "tool_b"]);
+		saveScopeConfig({
+			scope: "project",
+			cwd: projectDir,
+			names: ["tool_a", "unknown_tool", "tool_b"],
+			knownTools: known,
+		});
+
+		const projPath = getProjectConfigPath(projectDir);
+		expect(readConfigFile(projPath)).toEqual(["tool_a", "tool_b"]);
 	});
 });

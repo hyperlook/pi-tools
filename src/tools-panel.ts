@@ -67,6 +67,7 @@ function rowView(
 	selected: boolean,
 	isBuiltinTool: boolean,
 	isActive: boolean,
+	isInherited: boolean,
 ) {
 	const kind = toolKind(tool);
 
@@ -76,8 +77,9 @@ function rowView(
 			? theme.bold(theme.fg("muted", tool.name))
 			: theme.fg("muted", tool.name);
 		const badge = theme.fg("dim", KIND_BADGE[kind]);
-		const statusText = isActive ? "active 🔒" : "inactive 🔒";
-		const status = theme.fg(isActive ? "muted" : "dim", statusText);
+		const statusText = isActive ? "active" : "inactive";
+		const lockIcon = theme.fg("dim", " ⊘");
+		const status = `${theme.fg(isActive ? "muted" : "dim", statusText)}${lockIcon}`;
 		return {
 			cursor: selected ? theme.fg("dim", "→ ") : "  ",
 			dot,
@@ -89,25 +91,56 @@ function rowView(
 
 	const statusTone: ThemeColor = isActive ? "success" : "dim";
 	const kindTone: ThemeColor = kind === "loader" ? "accent" : "warning";
+	const baseStatus = isActive ? "enabled" : "disabled";
+	const inheritIcon = isInherited ? theme.fg("dim", " ⇡") : "";
+
 	return {
 		cursor: selected ? theme.fg("accent", "→ ") : "  ",
 		dot: theme.fg(statusTone, isActive ? "● " : "○ "),
 		name: selected ? theme.bold(theme.fg("accent", tool.name)) : tool.name,
 		badge: theme.fg(kindTone, KIND_BADGE[kind]),
-		status: theme.fg(statusTone, isActive ? "enabled" : "disabled"),
+		status: `${theme.fg(statusTone, baseStatus)}${inheritIcon}`,
 	};
 }
 
-type PanelAction = "up" | "down" | "pageUp" | "pageDown" | "toggle" | "toggleScope" | "quit";
+export type PanelAction =
+	| "up"
+	| "down"
+	| "pageUp"
+	| "pageDown"
+	| "toggle"
+	| "toggleScope"
+	| "resetInherit"
+	| "save"
+	| "cancel";
 
-function readAction(kb: KeybindingsManager, data: string): PanelAction | undefined {
+export function readAction(kb: KeybindingsManager, data: string): PanelAction | undefined {
 	if (kb.matches(data, "tui.select.up") || data === "k") return "up";
 	if (kb.matches(data, "tui.select.down") || data === "j") return "down";
 	if (kb.matches(data, "tui.select.pageUp")) return "pageUp";
 	if (kb.matches(data, "tui.select.pageDown")) return "pageDown";
-	if (kb.matches(data, "tui.select.confirm") || data === " ") return "toggle";
+	if (data === " ") return "toggle";
+	if (kb.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter) || data === "\r" || data === "\n") {
+		return "save";
+	}
 	if (matchesKey(data, Key.tab) || data === "\t") return "toggleScope";
-	if (kb.matches(data, "tui.select.cancel") || data === "q") return "quit";
+	if (data === "r" || data === "R") return "resetInherit";
+	if (kb.matches(data, "tui.select.cancel") || matchesKey(data, Key.escape) || data === "q") {
+		return "cancel";
+	}
+}
+
+function setsEqual(a: Set<string>, b: Set<string>): boolean {
+	if (a.size !== b.size) return false;
+	for (const item of a) {
+		if (!b.has(item)) return false;
+	}
+	return true;
+}
+
+export interface ToolsPanelSaveResult {
+	globalEnabled: Set<string>;
+	projectEnabled: Set<string> | undefined; // undefined 代表项目继承全局
 }
 
 export interface ToolsPanelOptions {
@@ -122,8 +155,9 @@ export interface ToolsPanelOptions {
 	projectDisplayPath: string;
 	globalDisplayPath: string;
 	isEnvOverridden?: boolean;
-	getScopeEnabled: (scope: ConfigScope) => Set<string>;
-	onToggle: (id: string, scope: ConfigScope) => void;
+	initialGlobalEnabled: Set<string>;
+	initialProjectEnabled: Set<string> | undefined; // undefined 表示项目未配置，继承全局
+	onSave: (result: ToolsPanelSaveResult) => void;
 }
 
 export function createToolsPanel(opts: ToolsPanelOptions) {
@@ -139,8 +173,9 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 		projectDisplayPath,
 		globalDisplayPath,
 		isEnvOverridden,
-		getScopeEnabled,
-		onToggle,
+		initialGlobalEnabled,
+		initialProjectEnabled,
+		onSave,
 	} = opts;
 
 	const total = tools.length;
@@ -148,11 +183,39 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 	const nameCol = Math.min(NAME_MAX, Math.max(NAME_MIN, ...tools.map((tool) => visibleWidth(tool.name))));
 	let selected = 0;
 	let currentScope: ConfigScope = initialScope;
-	let warningNotice: string | undefined;
+
+	// 草稿状态机
+	const globalDraft = new Set(initialGlobalEnabled);
+	let projectCustomized = initialProjectEnabled !== undefined;
+	let projectDraft = new Set(initialProjectEnabled ?? initialGlobalEnabled);
+
+	// 用于对比未保存修改（isDirty）
+	const origGlobal = new Set(initialGlobalEnabled);
+	const origProjectCustomized = initialProjectEnabled !== undefined;
+	const origProject = new Set(initialProjectEnabled ?? initialGlobalEnabled);
+
+	let noticeNotice: { text: string; tone: "warning" | "accent" | "muted" } | undefined;
+
+	function isDirty(): boolean {
+		if (!setsEqual(globalDraft, origGlobal)) return true;
+		if (projectCustomized !== origProjectCustomized) return true;
+		if (projectCustomized && !setsEqual(projectDraft, origProject)) return true;
+		return false;
+	}
+
+	function getActiveSet(): { enabled: Set<string>; isInherited: boolean } {
+		if (currentScope === "global") {
+			return { enabled: globalDraft, isInherited: false };
+		}
+		if (projectCustomized) {
+			return { enabled: projectDraft, isInherited: false };
+		}
+		return { enabled: globalDraft, isInherited: true };
+	}
 
 	return {
 		render(width: number) {
-			const scopeEnabled = getScopeEnabled(currentScope);
+			const { enabled: activeSet, isInherited } = getActiveSet();
 			const visible = Math.min(total, listH);
 			const start = windowStart(selected, total, visible);
 			const list: string[] = [];
@@ -162,9 +225,16 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 				const isBuiltinTool = isBuiltin(tool);
 				const isActive = isBuiltinTool
 					? activeBuiltinTools.has(tool.name)
-					: scopeEnabled.has(tool.name);
+					: activeSet.has(tool.name);
 
-				const row = rowView(theme, tool, i === selected, isBuiltinTool, isActive);
+				const row = rowView(
+					theme,
+					tool,
+					i === selected,
+					isBuiltinTool,
+					isActive,
+					!isBuiltinTool && isInherited,
+				);
 				list.push(truncateToWidth(
 					`${row.cursor}${row.dot}${padEndVisible(row.name, nameCol + 2)} ${padEndVisible(row.badge, BADGE_COL)}  ${row.status}`,
 					width,
@@ -175,17 +245,22 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 			const current = tools[selected];
 			const isBuiltinTool = current ? isBuiltin(current) : false;
 			const isBuiltinActive = isBuiltinTool && current ? activeBuiltinTools.has(current.name) : false;
-			const targetDisplay = currentScope === "project" ? projectDisplayPath : globalDisplayPath;
 
 			let noticeLine: string;
-			if (warningNotice) {
-				noticeLine = theme.fg("warning", `  ⚠️  ${warningNotice}`);
+			if (noticeNotice) {
+				noticeLine = theme.fg(noticeNotice.tone, `  ${noticeNotice.tone === "warning" ? "⚠️  " : "✓  "}${noticeNotice.text}`);
 			} else if (isBuiltinTool) {
 				noticeLine = isBuiltinActive
-					? theme.fg("muted", "  状态: 已由 Pi 官方启用（锁定只读 · 需在 settings.json defaultTools 中调整）")
-					: theme.fg("dim", "  状态: 未被 Pi 官方启用（锁定只读 · 需在 settings.json defaultTools 中添加）");
+					? theme.fg("muted", "  状态: 系统内置核心工具（⊘ 只读锁定 · 需在 settings.json defaultTools 中调整）")
+					: theme.fg("dim", "  状态: 系统内置核心工具（⊘ 未被 Pi 启用 · 需在 settings.json defaultTools 中添加）");
+			} else if (currentScope === "project") {
+				if (!projectCustomized) {
+					noticeLine = theme.fg("dim", `  提示: 标记 ⇡ 为继承全局 · 空格切换将以此为基底派生项目配置 (${projectDisplayPath})`);
+				} else {
+					noticeLine = theme.fg("dim", `  提示: 空格切换将修改项目配置 (${projectDisplayPath}) · 按 r 恢复继承全局`);
+				}
 			} else {
-				noticeLine = theme.fg("dim", `  提示: 开关将写入当前白名单配置 (${targetDisplay})`);
+				noticeLine = theme.fg("dim", `  提示: 空格切换将修改全局默认配置 (${globalDisplayPath})`);
 			}
 
 			const detail = current
@@ -203,24 +278,37 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 				scopeTag = theme.fg("warning", `[Env: ${globalDisplayPath}]`);
 				scopeDesc = "当前由 PI_TOOLS_CONFIG 环境变量直接接管配置";
 			} else if (currentScope === "project") {
-				scopeTag = theme.fg("accent", theme.bold(`[Project: ${projectDisplayPath}]`));
-				scopeDesc = `白名单写入当前项目 · 按 Tab 切为全局 (${globalDisplayPath})`;
+				if (projectCustomized) {
+					scopeTag = theme.fg("accent", theme.bold(`[Project: 已定制 (${projectDisplayPath})]`));
+					scopeDesc = `白名单写入当前项目 · 按 r 恢复继承全局 · 按 Tab 切为全局 (${globalDisplayPath})`;
+				} else {
+					scopeTag = theme.fg("accent", theme.bold(`[Project: 继承全局 (${globalDisplayPath})]`));
+					scopeDesc = `当前项目继承全局配置 · 空格微调将自动派生项目独立配置 · 按 Tab 切为全局`;
+				}
 			} else {
-				scopeTag = theme.fg("muted", theme.bold(`[Global: ${globalDisplayPath}]`));
+				scopeTag = theme.fg("muted", theme.bold(`[Global: 全局默认 (${globalDisplayPath})]`));
 				scopeDesc = canUseProjectScope
-					? `白名单写入全局默认 · 按 Tab 切为项目 (${projectDisplayPath})`
+					? `白名单写入全局默认 · 按 Tab 切为项目配置 (${projectDisplayPath})`
 					: "白名单写入全局默认（当前项目未受信任，不可使用项目级配置）";
 			}
 
+			const dirtyBadge = isDirty() ? theme.fg("warning", " [未保存 *]") : "";
 			const headerLine = truncateToWidth(
-				`${theme.fg("accent", theme.bold("Tool Configuration"))}  ${scopeTag}`,
+				`${theme.fg("accent", theme.bold("Tool Configuration"))}  ${scopeTag}${dirtyBadge}`,
 				width,
 			);
 			const subLine = truncateToWidth(theme.fg("muted", scopeDesc), width);
 
-			const footerHints = isEnvOverridden || !canUseProjectScope
-				? "  ↑/↓: 移动光标  ·  Space/Enter: 切换扩展工具  ·  Esc: 保存退出"
-				: "  ↑/↓: 移动光标  ·  Space/Enter: 切换扩展工具  ·  Tab: 切换作用域  ·  Esc: 保存退出";
+			let footerHints: string;
+			if (isEnvOverridden || !canUseProjectScope) {
+				footerHints = "  ↑/↓: 移动光标  ·  Space: 切换  ·  Enter: 保存生效  ·  Esc: 取消";
+			} else if (currentScope === "project" && projectCustomized) {
+				footerHints = "  ↑/↓: 移动光标  ·  Space: 切换  ·  Tab: 切换作用域  ·  r: 恢复继承全局  ·  Enter: 保存生效  ·  Esc: 取消";
+			} else if (currentScope === "project" && !projectCustomized) {
+				footerHints = "  ↑/↓: 移动光标  ·  Space: 切换(派生项目配置)  ·  Tab: 切换作用域  ·  Enter: 保存生效  ·  Esc: 取消";
+			} else {
+				footerHints = "  ↑/↓: 移动光标  ·  Space: 切换  ·  Tab: 切换作用域  ·  Enter: 保存生效  ·  Esc: 取消";
+			}
 
 			return [
 				headerLine,
@@ -238,13 +326,23 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 		handleInput(data: string) {
 			const action = readAction(kb, data);
 			if (!action) return;
-			if (action === "quit") {
+
+			if (action === "cancel") {
+				done(undefined);
+				return;
+			}
+
+			if (action === "save") {
+				onSave({
+					globalEnabled: globalDraft,
+					projectEnabled: projectCustomized ? projectDraft : undefined,
+				});
 				done(undefined);
 				return;
 			}
 
 			if (action === "toggleScope") {
-				warningNotice = undefined;
+				noticeNotice = undefined;
 				if (!isEnvOverridden && canUseProjectScope) {
 					currentScope = currentScope === "global" ? "project" : "global";
 					tui.requestRender();
@@ -252,28 +350,76 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 				return;
 			}
 
+			if (action === "resetInherit") {
+				if (currentScope === "project" && !isEnvOverridden && canUseProjectScope) {
+					if (projectCustomized) {
+						projectCustomized = false;
+						projectDraft = new Set(globalDraft);
+						noticeNotice = { text: "已重置项目配置，恢复继承全局", tone: "accent" };
+						tui.requestRender();
+						return;
+					}
+				}
+			}
+
 			if (total === 0) return;
 
 			if (action === "up") {
-				warningNotice = undefined;
+				noticeNotice = undefined;
 				selected = selected === 0 ? total - 1 : selected - 1;
 			} else if (action === "down") {
-				warningNotice = undefined;
+				noticeNotice = undefined;
 				selected = selected === total - 1 ? 0 : selected + 1;
 			} else if (action === "pageUp") {
-				warningNotice = undefined;
+				noticeNotice = undefined;
 				selected = Math.max(0, selected - PAGE_SIZE);
 			} else if (action === "pageDown") {
-				warningNotice = undefined;
+				noticeNotice = undefined;
 				selected = Math.min(total - 1, selected + PAGE_SIZE);
 			} else if (action === "toggle") {
 				const tool = tools[selected];
 				if (tool) {
 					if (isBuiltin(tool)) {
-						warningNotice = `内置核心工具 ${tool.name} 由官方托管，请在 settings.json 中调整`;
+						noticeNotice = {
+							text: `内置核心工具 ${tool.name} 由官方托管，请在 settings.json 中调整`,
+							tone: "warning",
+						};
 					} else {
-						warningNotice = undefined;
-						onToggle(tool.name, currentScope);
+						noticeNotice = undefined;
+						if (currentScope === "global") {
+							if (globalDraft.has(tool.name)) {
+								globalDraft.delete(tool.name);
+							} else {
+								globalDraft.add(tool.name);
+							}
+							// 若项目当前处于继承全局状态，项目的继承基准草稿同步联动
+							if (!projectCustomized) {
+								projectDraft = new Set(globalDraft);
+							}
+						} else {
+							// 项目作用域
+							if (!projectCustomized) {
+								// 继承态首次触发修改 -> 自动派生 Fork！
+								projectCustomized = true;
+								projectDraft = new Set(globalDraft);
+								if (projectDraft.has(tool.name)) {
+									projectDraft.delete(tool.name);
+								} else {
+									projectDraft.add(tool.name);
+								}
+								noticeNotice = {
+									text: "已基于全局配置派生项目独立配置草稿，按 r 可重置恢复继承",
+									tone: "accent",
+								};
+							} else {
+								// 已是项目独立配置
+								if (projectDraft.has(tool.name)) {
+									projectDraft.delete(tool.name);
+								} else {
+									projectDraft.add(tool.name);
+								}
+							}
+						}
 					}
 				}
 			}
