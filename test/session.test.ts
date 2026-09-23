@@ -55,26 +55,13 @@ describe("session enabled & sandbox tests", () => {
 		mockTool("custom_tool", "extension"),
 	];
 
-	it("strictly respects Pi builtin tools and pure allowlist (read-only sandbox scenario)", () => {
-		const initialActive = ["read"];
+	it("strictly respects Pi builtin tools and excludes disabled extension tools", () => {
+		const initialActive = ["read", "bash", "edit", "write"];
 
+		// Explicitly disable url_context
 		const projPath = getProjectConfigPath(projectDir);
 		writeConfigFile(projPath, ["url_context"]);
 
-		const result = newSessionEnabled(initialActive, allMockTools, projectDir, true);
-
-		// Must contain read and url_context ONLY
-		expect(Array.from(result).sort()).toEqual(["read", "url_context"]);
-		expect(result.has("bash")).toBe(false);
-		expect(result.has("edit")).toBe(false);
-		expect(result.has("write")).toBe(false);
-		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
-	});
-
-	it("pure allowlist: preserves Pi builtins but activates NO extensions or loader when config file is deleted/absent", () => {
-		const initialActive = ["read", "bash", "edit", "write"];
-
-		// No config file exists (user deleted it)
 		const result = newSessionEnabled(initialActive, allMockTools, projectDir, true);
 
 		// Builtin tools strictly preserved
@@ -83,23 +70,48 @@ describe("session enabled & sandbox tests", () => {
 		expect(result.has("edit")).toBe(true);
 		expect(result.has("write")).toBe(true);
 
-		// When config is missing/deleted, pure allowlist means ZERO extensions/loader active!
-		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
-		expect(result.has("web_search")).toBe(false);
+		// url_context is disabled
 		expect(result.has("url_context")).toBe(false);
+		// Other extensions remain active
+		expect(result.has("web_search")).toBe(true);
+		expect(result.has("custom_tool")).toBe(true);
+		// Since url_context is inactive, enable_tool is automatically enabled for on-demand dispatch
+		expect(result.has(LOADER_TOOL_NAME)).toBe(true);
 	});
 
-	it("activates enable_tool when explicitly present in defaultEnabled", () => {
+	it("zero disruption: activates ALL extensions by default when no config file exists (new user experience)", () => {
 		const initialActive = ["read", "bash", "edit", "write"];
 
+		// No config file exists (fresh install)
+		const result = newSessionEnabled(initialActive, allMockTools, projectDir, true);
+
+		// Builtins active
+		expect(result.has("read")).toBe(true);
+		expect(result.has("bash")).toBe(true);
+		expect(result.has("edit")).toBe(true);
+		expect(result.has("write")).toBe(true);
+
+		// All user extensions active! No tools broken for fresh users!
+		expect(result.has("web_search")).toBe(true);
+		expect(result.has("url_context")).toBe(true);
+		expect(result.has("custom_tool")).toBe(true);
+
+		// Because all extensions are already active, enable_tool does not need to consume prompt tokens
+		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
+	});
+
+	it("respects user decision to disable enable_tool itself", () => {
+		const initialActive = ["read", "bash", "edit", "write"];
+
+		// User disables url_context AND enable_tool
 		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, [LOADER_TOOL_NAME]);
+		writeConfigFile(projPath, ["url_context", LOADER_TOOL_NAME]);
 
 		const result = newSessionEnabled(initialActive, allMockTools, projectDir, true);
 
 		expect(result.has("read")).toBe(true);
-		expect(result.has(LOADER_TOOL_NAME)).toBe(true);
-		expect(result.has("web_search")).toBe(false);
+		expect(result.has("url_context")).toBe(false);
+		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
 	});
 
 	it("does not restore builtin tools if Pi natively disabled all of them", () => {
@@ -110,42 +122,40 @@ describe("session enabled & sandbox tests", () => {
 
 		const result = newSessionEnabled(initialActive, allMockTools, projectDir, true);
 
-		expect(Array.from(result)).toEqual(["web_search"]);
+		// Native builtins were empty, must remain empty
+		expect(result.has("read")).toBe(false);
+		expect(result.has("bash")).toBe(false);
+
+		// web_search was disabled, other extensions enabled
+		expect(result.has("web_search")).toBe(false);
+		expect(result.has("url_context")).toBe(true);
+		expect(result.has("custom_tool")).toBe(true);
 	});
 
-	it("prioritizes project config over global config for extension allowlist", () => {
+	it("prioritizes project config over global config for extension disabled list", () => {
 		const initialActive = ["read", "bash"];
 
 		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, [LOADER_TOOL_NAME, "web_search"]);
+		writeConfigFile(globalPath, ["web_search"]);
 
 		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, [LOADER_TOOL_NAME, "custom_tool"]);
+		writeConfigFile(projPath, ["url_context"]);
 
 		const result = newSessionEnabled(initialActive, allMockTools, projectDir, true);
 
-		expect(result.has("read")).toBe(true);
-		expect(result.has("bash")).toBe(true);
-		expect(result.has(LOADER_TOOL_NAME)).toBe(true);
-		expect(result.has("custom_tool")).toBe(true);
-		expect(result.has("web_search")).toBe(false);
+		// Project config disables url_context, not web_search
+		expect(result.has("web_search")).toBe(true);
+		expect(result.has("url_context")).toBe(false);
 	});
 
 	it("guarantees getInactiveTools dispatcher pool contains ONLY extensions, NEVER builtins or loader", () => {
-		const activeNames = ["read"];
-
+		const activeNames = ["read", "bash", "edit", "write", LOADER_TOOL_NAME, "web_search"];
 		const inactive = getInactiveTools(allMockTools, activeNames);
-		const inactiveNames = inactive.map((t) => t.name);
 
-		expect(inactiveNames).toContain("web_search");
-		expect(inactiveNames).toContain("url_context");
-		expect(inactiveNames).toContain("custom_tool");
-
-		expect(inactiveNames).not.toContain("bash");
-		expect(inactiveNames).not.toContain("edit");
-		expect(inactiveNames).not.toContain("write");
-		expect(inactiveNames).not.toContain("read");
-
-		expect(inactiveNames).not.toContain(LOADER_TOOL_NAME);
+		// Should only contain url_context and custom_tool
+		expect(inactive.map((t) => t.name).sort()).toEqual(["custom_tool", "url_context"]);
+		expect(inactive.some((t) => t.name === "read")).toBe(false);
+		expect(inactive.some((t) => t.name === "bash")).toBe(false);
+		expect(inactive.some((t) => t.name === LOADER_TOOL_NAME)).toBe(false);
 	});
 });

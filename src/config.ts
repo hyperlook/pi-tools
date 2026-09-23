@@ -10,7 +10,7 @@ export type ConfigScope = "project" | "global";
 export interface ConfigResolution {
 	scope: ConfigScope;
 	path: string;
-	tools: string[] | undefined;
+	disabledTools: string[] | undefined;
 	hasProjectConfig: boolean;
 	isEnvOverridden: boolean;
 }
@@ -38,24 +38,32 @@ export function hasProjectConfig(cwd: string): boolean {
 export function readConfigFile(filePath: string): string[] | undefined {
 	if (!existsSync(filePath)) return undefined;
 	try {
-		const parsed = JSON.parse(readFileSync(filePath, "utf8")) as { defaultEnabled?: unknown };
-		if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.defaultEnabled)) {
+		const parsed = JSON.parse(readFileSync(filePath, "utf8")) as {
+			disabledTools?: unknown;
+			defaultEnabled?: unknown;
+		};
+		if (!parsed || typeof parsed !== "object") {
 			return undefined;
 		}
-		return parsed.defaultEnabled.filter((name): name is string => typeof name === "string" && name.trim() !== "");
+		if (Array.isArray(parsed.disabledTools)) {
+			return parsed.disabledTools.filter(
+				(name): name is string => typeof name === "string" && name.trim() !== "",
+			);
+		}
+		return [];
 	} catch {
 		return undefined;
 	}
 }
 
-export function writeConfigFile(filePath: string, names: string[]): void {
+export function writeConfigFile(filePath: string, disabledNames: string[]): void {
 	const dir = dirname(filePath);
 	if (!existsSync(dir)) {
 		mkdirSync(dir, { recursive: true });
 	}
 	writeFileSync(
 		filePath,
-		`${JSON.stringify({ defaultEnabled: names }, null, 2)}\n`,
+		`${JSON.stringify({ disabledTools: disabledNames }, null, 2)}\n`,
 		"utf8",
 	);
 }
@@ -80,7 +88,7 @@ export function resolveEffectiveConfig(cwd: string, isProjectTrusted: boolean): 
 		return {
 			scope: "global",
 			path: envPath,
-			tools: readConfigFile(envPath),
+			disabledTools: readConfigFile(envPath),
 			hasProjectConfig: false,
 			isEnvOverridden: true,
 		};
@@ -90,12 +98,12 @@ export function resolveEffectiveConfig(cwd: string, isProjectTrusted: boolean): 
 	const projectExists = existsSync(projectPath);
 
 	if (isProjectTrusted && projectExists) {
-		const projectTools = readConfigFile(projectPath);
-		if (projectTools !== undefined) {
+		const projectDisabled = readConfigFile(projectPath);
+		if (projectDisabled !== undefined) {
 			return {
 				scope: "project",
 				path: projectPath,
-				tools: projectTools,
+				disabledTools: projectDisabled,
 				hasProjectConfig: true,
 				isEnvOverridden: false,
 			};
@@ -106,7 +114,7 @@ export function resolveEffectiveConfig(cwd: string, isProjectTrusted: boolean): 
 	return {
 		scope: "global",
 		path: globalPath,
-		tools: readConfigFile(globalPath),
+		disabledTools: readConfigFile(globalPath),
 		hasProjectConfig: projectExists,
 		isEnvOverridden: false,
 	};
@@ -124,10 +132,10 @@ export function deleteProjectConfigFile(cwd: string): boolean {
 export function saveScopeConfig(options: {
 	scope: ConfigScope;
 	cwd: string;
-	names: string[];
+	disabledNames: string[];
 	knownTools: Set<string>;
 }): void {
-	const { scope, cwd, names, knownTools } = options;
+	const { scope, cwd, disabledNames, knownTools } = options;
 	let targetPath: string;
 	if (process.env.PI_TOOLS_CONFIG) {
 		targetPath = process.env.PI_TOOLS_CONFIG;
@@ -137,7 +145,7 @@ export function saveScopeConfig(options: {
 		targetPath = getGlobalConfigPath();
 	}
 
-	const filtered = names.filter((name) => knownTools.has(name));
+	const filtered = disabledNames.filter((name) => knownTools.has(name));
 	writeConfigFile(targetPath, filtered);
 }
 
@@ -145,9 +153,10 @@ export function saveScopeConfig(options: {
  * 将某个工具的开关状态持久化到目标 Scope：
  * - targetScope === "project"：写入 <cwd>/.pi/pi-tools.json
  * - targetScope === "global"：写入 ~/.pi/agent/pi-tools.json
- * 纯白名单原则：
+ * 主动失活差量原则（Opt-out）：
  * 1. 仅对扩展工具与调度器生效，系统内置核心工具绝对拦截。
- * 2. 真实读取目标作用域配置（若此前无配置，则以空基底 [] 派生，绝无暗箱兜底）。
+ * 2. 真实读取目标作用域配置（若此前无配置，则以空基底 [] 派生）。
+ * 3. enabled === true 代表从失活名单中移出；enabled === false 代表加入失活名单。
  */
 export function persistToolPreference(options: {
 	toolName: string;
@@ -172,9 +181,9 @@ export function persistToolPreference(options: {
 	const set = new Set(baseList);
 
 	if (enabled) {
-		set.add(toolName);
-	} else {
 		set.delete(toolName);
+	} else {
+		set.add(toolName);
 	}
 
 	const filtered = Array.from(set).filter((name) => knownTools.has(name));

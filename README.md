@@ -2,7 +2,7 @@
 
 Pi 编码助手的**按需工具加载与管理扩展**（Deferred Tool Loader & Manager）。
 
-会话开始时自动扫描本机所有已注册工具：**内置工具默认开启，第三方/自定义扩展工具默认挂起（按需加载）**。通过向模型提供轻量级的 `enable_tool` 调度工具，在需要时增量激活具体工具，大幅削减 Prompt Token 占用，并保护 LLM 的前缀缓存（Prompt Cache）。
+会话开始时自动扫描本机所有已注册工具：**内置工具默认开启，第三方/自定义扩展工具默认全量可用（零破坏开箱即用）**。用户可在 `/tools` 面板中自主将不需要常驻的扩展工具失活挂起；当存在失活工具时，插件会自动向模型提供轻量级的 `enable_tool` 调度工具，在任务需要时增量激活，既削减 Prompt Token 占用，又保护 LLM 的前缀缓存（Prompt Cache）。
 
 ---
 
@@ -63,7 +63,7 @@ pi install git:github.com/hyperlook/pi-tools
   - **`[Project]`**：写入 `<cwd>/.pi/pi-tools.json`，仅在当前项目生效，便于随代码仓库共享。
   - **`[Global]`**：写入 `~/.pi/agent/pi-tools.json`，在所有未指定项目级配置的项目中作为默认值。
 - **内置核心工具**（如 `read`, `bash`, `edit`, `write`）：完全归 Pi 官方托管，在面板中**灰显锁定且只读**（标注 `pi native`），本插件彻底不碰、不改、不持久化，杜绝操作困惑与误触。
-- **按需调度器 `enable_tool` & 扩展工具**：纯白名单机制。按空格自由开/关并持久化到当前作用域（Project / Global）。当配置文件不存在或被删除时，白名单为空，没有任何扩展工具或调度器初始激活。
+- **按需调度器 `enable_tool` & 扩展工具**：主动失活（Opt-out）机制。按空格自由开/关并持久化到当前作用域（Project / Global）。当无配置文件时，失活列表为空，用户的所有工具默认保持启用（对新安装用户 0 破坏）；仅当用户主动在面板中关闭某个工具时，才会将其写入失活名单转入按需挂起池。
 
 ### 2. 模型自动激活
 当 LLM 发现当前激活的工具无法满足任务需求时，会主动调用 `enable_tool`：
@@ -112,19 +112,18 @@ pi install git:github.com/hyperlook/pi-tools
 | 3 | 全局级 | `~/.pi/agent/pi-tools.json` | 跨项目的全局兜底偏好 |
 
 ### 覆盖策略与安全性
-1. **项目覆盖全局（Project Overrides Global）**：当受信任的项目存在 `.pi/pi-tools.json` 时，新会话将优先使用该项目配置中指定的扩展工具列表，未配置或未受信任时回退到全局配置。
-2. **Project Trust 安全联动**：未被信任的项目不会加载其 `.pi/pi-tools.json`，自动降级使用全局配置，防止恶意仓库静默激活高危或外部工具。
+1. **项目覆盖全局（Project Overrides Global）**：当受信任的项目存在 `.pi/pi-tools.json` 时，新会话将优先使用该项目配置中指定的失活工具名单（`disabledTools`），未配置或未受信任时回退到全局配置。
+2. **Project Trust 安全联动**：未被信任的项目不会加载其 `.pi/pi-tools.json`，自动降级使用全局配置。
 3. **配置文件格式**：
 ```json
 {
-  "defaultEnabled": [
-    "enable_tool",
-    "web_search",
-    "url_context"
+  "disabledTools": [
+    "quarkclouddrive",
+    "imagine"
   ]
 }
 ```
-> 若某个项目需要保持零扩展工具纯净沙箱环境，项目配置可设为空数组：`{ "defaultEnabled": [] }`（此时 `enable_tool` 亦被关闭，大模型无法自行激活任何扩展工具）。
+> 若某个项目需要保持零扩展工具纯净沙箱环境，可将不需要的工具或 `enable_tool` 加入 `disabledTools`。
 
 ## 开源协议
 

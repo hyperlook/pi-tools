@@ -48,8 +48,11 @@ export function catalogFrom(tools: ToolInfo[]): CatalogEntry[] {
 /**
  * 确定新会话中应该激活的工具集合：
  * 1. 内置核心工具：严格保留 Pi 启动时原生传入且受支持的内置工具，不多加、不少减。
- * 2. 扩展工具 & 调度器：纯白名单！若配置文件存在，仅激活列在 defaultEnabled 中的工具；
- *    若无任何配置文件（被删除或未配置），白名单为空，所有扩展工具与调度器均不激活。
+ * 2. 扩展工具：主动差量失活机制（Opt-out）。无配置时全部扩展工具默认激活；
+ *    仅排除列在 disabledTools 中的工具。
+ * 3. 调度器 enable_tool：
+ *    当且仅当 enable_tool 自身未被失活，且当前存在被失活的扩展工具时激活（0 token 冗余）；
+ *    若所有扩展工具都已处于激活状态，无需激活调度器。
  */
 export function newSessionEnabled(
 	initialActiveTools: string[],
@@ -68,16 +71,23 @@ export function newSessionEnabled(
 		}
 	}
 
-	// 2. 扩展工具 & 调度器：读取有效配置（纯白名单）
+	// 2. 扩展工具：读取当前生效的 disabledTools 配置（失活名单）
 	const config = resolveEffectiveConfig(cwd, trusted);
-	if (config.tools) {
-		for (const name of config.tools) {
-			const tool = toolMap.get(name);
-			if (name === LOADER_TOOL_NAME) {
-				next.add(LOADER_TOOL_NAME);
-			} else if (tool && isOnDemand(tool)) {
-				next.add(name);
-			}
+	const disabledSet = new Set(config.disabledTools ?? []);
+
+	for (const tool of allTools) {
+		if (isOnDemand(tool) && !disabledSet.has(tool.name)) {
+			next.add(tool.name);
+		}
+	}
+
+	// 3. 调度器：若未被失活，且存在未激活的扩展工具时启用
+	if (!disabledSet.has(LOADER_TOOL_NAME)) {
+		const hasInactiveExtensions = allTools.some(
+			(tool) => isOnDemand(tool) && !next.has(tool.name),
+		);
+		if (hasInactiveExtensions) {
+			next.add(LOADER_TOOL_NAME);
 		}
 	}
 
@@ -160,6 +170,10 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			enabledTools = newSessionEnabled(currentActive, allTools, currentCwd, isProjectTrusted);
 		}
 		replaceActiveTools();
+
+		// 同步根据当前确定的 enabledTools，刷新 loader 的 catalog，精准只包含失活扩展工具
+		const inactive = getInactiveTools(allTools, Array.from(enabledTools));
+		registerLoader(catalogFrom(inactive));
 	}
 
 	function registerLoader(catalog: CatalogEntry[]) {
@@ -268,13 +282,30 @@ export default function toolsExtension(pi: ExtensionAPI) {
 					.map((t) => t.name),
 			);
 
-			const initialGlobalList = readScopeConfig("global", currentCwd);
-			const initialGlobalEnabled = new Set(initialGlobalList ?? []);
+			// 可被本面板管理的全部工具（非内置工具 + loader）
+			const manageableTools = tools.filter((t) => isOnDemand(t) || t.name === LOADER_TOOL_NAME);
 
-			const initialProjectList = readScopeConfig("project", currentCwd);
-			const initialProjectEnabled = hasProjectConfig(currentCwd) && initialProjectList !== undefined
-				? new Set(initialProjectList)
-				: undefined;
+			const globalDisabledList = readScopeConfig("global", currentCwd) ?? [];
+			const globalDisabledSet = new Set(globalDisabledList);
+			const initialGlobalEnabled = new Set(
+				manageableTools
+					.filter((t) => !globalDisabledSet.has(t.name))
+					.map((t) => t.name),
+			);
+
+			const projectExists = hasProjectConfig(currentCwd);
+			let initialProjectEnabled: Set<string> | undefined;
+			if (projectExists) {
+				const projectDisabledList = readScopeConfig("project", currentCwd);
+				if (projectDisabledList !== undefined) {
+					const projectDisabledSet = new Set(projectDisabledList);
+					initialProjectEnabled = new Set(
+						manageableTools
+							.filter((t) => !projectDisabledSet.has(t.name))
+							.map((t) => t.name),
+					);
+				}
+			}
 
 			await ctx.ui.custom((tui, theme, kb, done) =>
 				createToolsPanel({
@@ -292,17 +323,17 @@ export default function toolsExtension(pi: ExtensionAPI) {
 					initialGlobalEnabled,
 					initialProjectEnabled,
 					onSave(result) {
-						const known = new Set(
-							allTools
-								.filter((tool) => isOnDemand(tool) || tool.name === LOADER_TOOL_NAME)
-								.map((tool) => tool.name),
-						);
+						const known = new Set(manageableTools.map((tool) => tool.name));
 
-						// 1. 保存全局配置
+						// 1. 将全局中未勾选（disabled）的工具收集起来作为 disabledTools 保存
+						const globalDisabled = manageableTools
+							.filter((tool) => !result.globalEnabled.has(tool.name))
+							.map((tool) => tool.name);
+
 						saveScopeConfig({
 							scope: "global",
 							cwd: currentCwd,
-							names: Array.from(result.globalEnabled),
+							disabledNames: globalDisabled,
 							knownTools: known,
 						});
 
@@ -312,20 +343,26 @@ export default function toolsExtension(pi: ExtensionAPI) {
 								// 项目选择恢复继承全局 -> 删除项目独立配置文件
 								deleteProjectConfigFile(currentCwd);
 							} else {
-								// 项目独立定制 -> 写入项目配置文件
+								// 项目独立定制 -> 收集未勾选的工具作为 disabledTools
+								const projectDisabled = manageableTools
+									.filter((tool) => !result.projectEnabled!.has(tool.name))
+									.map((tool) => tool.name);
+
 								saveScopeConfig({
 									scope: "project",
 									cwd: currentCwd,
-									names: Array.from(result.projectEnabled),
+									disabledNames: projectDisabled,
 									knownTools: known,
 								});
 							}
 						}
 
-						// 3. 重新同步当前生效会话工具
+						// 3. 重新同步当前生效会话工具与 loader catalog
 						const currentActive = pi.getActiveTools();
 						enabledTools = newSessionEnabled(currentActive, allTools, currentCwd, isProjectTrusted);
 						replaceActiveTools();
+						const inactive = getInactiveTools(allTools, Array.from(enabledTools));
+						registerLoader(catalogFrom(inactive));
 						persistSession();
 						ctx.ui.notify("工具配置已保存并生效", "info");
 					},
@@ -338,7 +375,6 @@ export default function toolsExtension(pi: ExtensionAPI) {
 		currentCwd = ctx.cwd;
 		isProjectTrusted = ctx.isProjectTrusted();
 		allTools = pi.getAllTools();
-		registerLoader(catalogFrom(allTools));
 		restoreFromBranch(ctx);
 	});
 

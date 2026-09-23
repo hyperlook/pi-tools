@@ -60,7 +60,7 @@ describe("config tests", () => {
 
 		const res = resolveEffectiveConfig(projectDir, true);
 		expect(res.scope).toBe("global");
-		expect(res.tools).toEqual(["web_search", "mcp"]);
+		expect(res.disabledTools).toEqual(["web_search", "mcp"]);
 		expect(res.hasProjectConfig).toBe(false);
 	});
 
@@ -73,7 +73,7 @@ describe("config tests", () => {
 
 		const res = resolveEffectiveConfig(projectDir, true);
 		expect(res.scope).toBe("project");
-		expect(res.tools).toEqual(["custom_tool"]);
+		expect(res.disabledTools).toEqual(["custom_tool"]);
 		expect(res.hasProjectConfig).toBe(true);
 	});
 
@@ -86,7 +86,7 @@ describe("config tests", () => {
 
 		const res = resolveEffectiveConfig(projectDir, false);
 		expect(res.scope).toBe("global");
-		expect(res.tools).toEqual(["web_search"]);
+		expect(res.disabledTools).toEqual(["web_search"]);
 	});
 
 	it("prioritizes PI_TOOLS_CONFIG env var over project and global", () => {
@@ -100,17 +100,17 @@ describe("config tests", () => {
 		const res = resolveEffectiveConfig(projectDir, true);
 		expect(res.scope).toBe("global");
 		expect(res.path).toBe(envConfigFile);
-		expect(res.tools).toEqual(["env_tool"]);
+		expect(res.disabledTools).toEqual(["env_tool"]);
 		expect(res.isEnvOverridden).toBe(true);
 	});
 
-	it("creates pure allowlist without injecting surprise tools when no config exists", () => {
+	it("adds tool to disabledTools when disabled via persistToolPreference", () => {
 		const known = new Set([LOADER_TOOL_NAME, "web_search"]);
 
-		// Neither project nor global config exists
+		// Disabling web_search when no prior config existed
 		persistToolPreference({
 			toolName: "web_search",
-			enabled: true,
+			enabled: false,
 			targetScope: "project",
 			cwd: projectDir,
 			knownTools: known,
@@ -118,11 +118,21 @@ describe("config tests", () => {
 
 		const projPath = getProjectConfigPath(projectDir);
 		expect(existsSync(projPath)).toBe(true);
-		// Must only contain web_search, never magically auto-enable enable_tool
+		// Must record web_search in disabledTools
 		expect(readConfigFile(projPath)).toEqual(["web_search"]);
+
+		// Re-enabling web_search removes it from disabledTools
+		persistToolPreference({
+			toolName: "web_search",
+			enabled: true,
+			targetScope: "project",
+			cwd: projectDir,
+			knownTools: known,
+		});
+		expect(readConfigFile(projPath)).toEqual([]);
 	});
 
-	it("allows project to explicitly disable all extension tools with empty array", () => {
+	it("allows project to explicitly have empty disabledTools array", () => {
 		const globalPath = join(globalDir, "pi-tools.json");
 		writeConfigFile(globalPath, ["web_search", "mcp"]);
 
@@ -131,7 +141,7 @@ describe("config tests", () => {
 
 		const res = resolveEffectiveConfig(projectDir, true);
 		expect(res.scope).toBe("project");
-		expect(res.tools).toEqual([]);
+		expect(res.disabledTools).toEqual([]);
 		expect(res.hasProjectConfig).toBe(true);
 	});
 
@@ -145,7 +155,7 @@ describe("config tests", () => {
 
 		const res = resolveEffectiveConfig(projectDir, true);
 		expect(res.scope).toBe("global");
-		expect(res.tools).toEqual(["web_search"]);
+		expect(res.disabledTools).toEqual(["web_search"]);
 	});
 
 	it("modifies existing project config without touching global", () => {
@@ -157,9 +167,10 @@ describe("config tests", () => {
 
 		const known = new Set(["custom_tool_1", "custom_tool_2"]);
 
+		// Disable custom_tool_2 on project
 		persistToolPreference({
 			toolName: "custom_tool_2",
-			enabled: true,
+			enabled: false,
 			targetScope: "project",
 			cwd: projectDir,
 			knownTools: known,
@@ -186,9 +197,9 @@ describe("config tests", () => {
 		expect(readConfigFile(globalPath)).toEqual([LOADER_TOOL_NAME]);
 	});
 
-	it("allows disabling enable_tool in defaultEnabled", () => {
+	it("allows disabling enable_tool in disabledTools", () => {
 		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, [LOADER_TOOL_NAME, "web_search"]);
+		writeConfigFile(globalPath, ["web_search"]);
 
 		const known = new Set([LOADER_TOOL_NAME, "web_search"]);
 
@@ -200,7 +211,7 @@ describe("config tests", () => {
 			knownTools: known,
 		});
 
-		expect(readConfigFile(globalPath)).toEqual(["web_search"]);
+		expect(readConfigFile(globalPath)?.sort()).toEqual(["enable_tool", "web_search"]);
 	});
 
 	it("reads scope config accurately using readScopeConfig", () => {
@@ -229,7 +240,7 @@ describe("config tests", () => {
 		saveScopeConfig({
 			scope: "project",
 			cwd: projectDir,
-			names: ["tool_a", "unknown_tool", "tool_b"],
+			disabledNames: ["tool_a", "unknown_tool", "tool_b"],
 			knownTools: known,
 		});
 
