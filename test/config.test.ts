@@ -11,6 +11,7 @@ import {
 	persistToolPreference,
 	readConfigFile,
 	readScopeConfig,
+	configFingerprint,
 	resolveEffectiveConfig,
 	saveScopeConfig,
 	writeConfigFile,
@@ -75,6 +76,25 @@ describe("config tests", () => {
 		expect(res.scope).toBe("project");
 		expect(res.disabledTools).toEqual(["custom_tool"]);
 		expect(res.hasProjectConfig).toBe(true);
+	});
+
+	it("changes fingerprint when the effective disabledTools change", () => {
+		const before = configFingerprint(projectDir, true);
+		writeConfigFile(getProjectConfigPath(projectDir), ["image_gen"]);
+		const after = configFingerprint(projectDir, true);
+		expect(after).not.toBe(before);
+		expect(configFingerprint(projectDir, true)).toBe(after);
+	});
+
+	it("produces identical fingerprint regardless of disabledTools array order", () => {
+		const projPath = getProjectConfigPath(projectDir);
+		writeConfigFile(projPath, ["web_search", "image_gen", "bash"]);
+		const fp1 = configFingerprint(projectDir, true);
+
+		writeConfigFile(projPath, ["bash", "image_gen", "web_search"]);
+		const fp2 = configFingerprint(projectDir, true);
+
+		expect(fp1).toBe(fp2);
 	});
 
 	it("ignores project config when project is not trusted", () => {

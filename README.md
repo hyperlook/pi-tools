@@ -17,7 +17,7 @@ pi install git:github.com/hyperlook/pi-tools
 ## 它是怎么工作的？
 
 - **内置工具常驻**：`read`、`bash`、`edit`、`write` 等 Pi 原生核心工具由pi 命令自行管理。
-- **扩展工具按需激活**：未激活的扩展工具收敛为待命目录，当任务需要时，模型会自动调用 `enable_tool` 增量激活（下一轮即可使用完整 Schema），保护前缀缓存（Prompt Cache）。
+- **扩展工具按需激活**：未激活的扩展工具收敛为待命目录，当任务需要时，模型会自动调用 `enable_tool` 增量激活。新工具在**同一次用户请求的下一助手回合**带上完整 Schema，不用用户再发一条消息。
 - **零破坏开箱即用**：首次安装默认全量可用，仅将你主动在面板中停用的工具转入待命池。
 
 ---
@@ -58,7 +58,7 @@ pi install git:github.com/hyperlook/pi-tools
 }
 ```
 
-> **提示**：未信任的项目（Untrusted Project）会自动降级仅使用全局配置，保障安全。
+> **提示**：未信任的项目（Untrusted Project）会自动降级仅使用全局配置，保障安全。进行中的会话会在下一条消息前重新读取这个文件，resume 同样以磁盘为准。`enable_tool` 只改当前分支，不写回配置；在 `/tools` 里保存会按磁盘策略重置这条会话增量。
 
 ---
 

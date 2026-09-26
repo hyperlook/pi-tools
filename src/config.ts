@@ -120,6 +120,25 @@ export function resolveEffectiveConfig(cwd: string, isProjectTrusted: boolean): 
 	};
 }
 
+/**
+ * 磁盘策略指纹。只比较生效路径和 disabledTools 语义，
+ * 格式化改动不会触发会话重载。
+ */
+export function configFingerprint(cwd: string, isProjectTrusted: boolean): string {
+	const effective = resolveEffectiveConfig(cwd, isProjectTrusted);
+	const disabled =
+		effective.disabledTools === undefined
+			? "<missing>"
+			: effective.disabledTools.slice().sort().join("\0");
+	return [
+		effective.scope,
+		effective.path,
+		effective.hasProjectConfig ? "1" : "0",
+		effective.isEnvOverridden ? "1" : "0",
+		disabled,
+	].join("|");
+}
+
 export function deleteProjectConfigFile(cwd: string): boolean {
 	const projectPath = getProjectConfigPath(cwd);
 	if (existsSync(projectPath)) {

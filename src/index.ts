@@ -1,13 +1,31 @@
 /**
- * pi-tools: 按需启用扩展工具（终极纯白名单方案）
- * 1. 系统内置工具归官方（Zero Blast Radius）：彻底不碰、不持久化，面板变灰只读。
- * 2. 扩展工具与调度器收敛为纯白名单：唯一字段 defaultEnabled，无配置则全关，按需在面板配置点亮。
- * 3. 安全沙箱无越权风险：调度池仅包含扩展工具，模型绝无法越权自激活内置核心工具。
+ * pi-tools: 按需启用扩展工具
+ * 1. 内置工具归 Pi，本扩展不改、不持久化。
+ * 2. 扩展工具默认全开，disabledTools 是磁盘失活策略。
+ * 3. enable_tool 只追加本分支的会话增量，不写回配置文件。
+ * 4. 恢复会话时磁盘策略优先；旧的 enabledTools 绝对快照不能盖住外部修改。
+ * 5. 工具在同一用户请求的下一助手回合生效（Pi prepareNextTurn 会刷新快照）。
+ *    同一条助手消息里的并行调用物理上拿不到新 schema，所以禁止同条连调，而不是让用户再发一条。
  */
 
 import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+	ACTIVATION_CONTRACT,
+	activationResultText,
+	activationsFromSaved,
+	applySessionActivations,
+	injectToolsNotice,
+	lastToolsState,
+	managedToolDelta,
+	pruneSessionActivated,
+	sameStringSet,
+	toolsStateChanged,
+	toolsUpdateNotice,
+	type StoredToolsState,
+} from "./activation.ts";
+import {
+	configFingerprint,
 	deleteProjectConfigFile,
 	formatDisplayPath,
 	getGlobalConfigPath,
@@ -26,9 +44,7 @@ import {
 } from "./shared.ts";
 import { createToolsPanel, sortTools } from "./tools-panel.ts";
 
-export interface ToolsState {
-	enabledTools: string[];
-}
+export type { StoredToolsState as ToolsState } from "./activation.ts";
 
 export interface CatalogEntry {
 	name: string;
@@ -128,19 +144,59 @@ export function matchByQuery(inactive: ToolInfo[], query: string): ToolInfo[] {
 
 export default function toolsExtension(pi: ExtensionAPI) {
 	let enabledTools: Set<string> = new Set();
+	let sessionActivated = new Set<string>();
 	let allTools: ToolInfo[] = [];
 	let currentCwd: string = process.cwd();
 	let isProjectTrusted: boolean = true;
+	let configStamp = "";
+	let pendingContextNotice = "";
 
-	function persistSession() {
-		pi.appendEntry<ToolsState>("tools-config", {
-			enabledTools: Array.from(enabledTools),
-		});
+	function disabledNames(): Set<string> {
+		return new Set(resolveEffectiveConfig(currentCwd, isProjectTrusted).disabledTools ?? []);
 	}
 
-	/** TUI / 会话恢复：整表替换。loader 执行期间不要走这条。 */
+	function computeEnabled(initialActive: string[]): Set<string> {
+		allTools = pi.getAllTools();
+		return applySessionActivations(
+			newSessionEnabled(initialActive, allTools, currentCwd, isProjectTrusted),
+			sessionActivated,
+			allTools,
+			disabledNames(),
+		);
+	}
+
+	function persistSession() {
+		const state: StoredToolsState = {
+			enabledTools: Array.from(enabledTools),
+			sessionActivated: Array.from(sessionActivated),
+		};
+		pi.appendEntry<StoredToolsState>("tools-config", state);
+	}
+
+	/** TUI / 会话恢复：整表替换。loader 执行期间也可以走这条，Pi 会在下一助手回合装载。 */
 	function replaceActiveTools() {
 		pi.setActiveTools(Array.from(enabledTools));
+	}
+
+	function syncLoader() {
+		const inactive = getInactiveTools(allTools, Array.from(enabledTools));
+		registerLoader(catalogFrom(inactive));
+	}
+
+	function queueToolsNotice(before: Iterable<string>, after: Iterable<string>) {
+		const { enabled, disabled } = managedToolDelta(before, after, allTools);
+		const notice = toolsUpdateNotice(enabled, disabled);
+		if (notice) pendingContextNotice = notice;
+	}
+
+	function installEnabled(next: Set<string>, options: { persist: boolean; noticeFrom?: Iterable<string> }) {
+		const previous = options.noticeFrom ?? enabledTools;
+		enabledTools = next;
+		sessionActivated = new Set(pruneSessionActivated(sessionActivated, enabledTools, allTools, disabledNames()));
+		syncLoader();
+		replaceActiveTools();
+		if (options.noticeFrom) queueToolsNotice(previous, enabledTools);
+		if (options.persist) persistSession();
 	}
 
 	function restoreFromBranch(ctx: ExtensionContext) {
@@ -148,50 +204,44 @@ export default function toolsExtension(pi: ExtensionAPI) {
 		isProjectTrusted = ctx.isProjectTrusted();
 		allTools = pi.getAllTools();
 
-		const currentActive = pi.getActiveTools();
-		const branchEntries = ctx.sessionManager.getBranch();
-		let savedTools: string[] | undefined;
+		const saved = lastToolsState(ctx.sessionManager.getBranch().map((entry) => ({
+			type: entry.type,
+			customType: "customType" in entry ? entry.customType : undefined,
+			data: "data" in entry ? entry.data : undefined,
+		})));
+		sessionActivated = new Set(activationsFromSaved(saved));
+		const next = computeEnabled(pi.getActiveTools());
+		const persist = toolsStateChanged(saved, next, pruneSessionActivated(sessionActivated, next, allTools, disabledNames()));
+		installEnabled(next, { persist });
+		configStamp = configFingerprint(currentCwd, isProjectTrusted);
+	}
 
-		for (const entry of branchEntries) {
-			if (entry.type === "custom" && entry.customType === "tools-config") {
-				const data = entry.data as ToolsState | undefined;
-				if (data?.enabledTools) {
-					savedTools = data.enabledTools;
-				}
-			}
-		}
-
-		if (savedTools) {
-			const allToolNames = new Set(allTools.map((t) => t.name));
-			enabledTools = new Set(
-				savedTools.filter((t) => allToolNames.has(t) && isSupported(t)),
-			);
-		} else {
-			enabledTools = newSessionEnabled(currentActive, allTools, currentCwd, isProjectTrusted);
-		}
-		replaceActiveTools();
-
-		// 同步根据当前确定的 enabledTools，刷新 loader 的 catalog，精准只包含失活扩展工具
-		const inactive = getInactiveTools(allTools, Array.from(enabledTools));
-		registerLoader(catalogFrom(inactive));
+	/** 外部改了 pi-tools.json：下一条消息前按磁盘重算，保留尚未被磁盘覆盖的 enable_tool 增量。 */
+	function reloadConfigIfChanged() {
+		const stamp = configFingerprint(currentCwd, isProjectTrusted);
+		if (stamp === configStamp) return;
+		configStamp = stamp;
+		allTools = pi.getAllTools();
+		const previous = new Set(enabledTools);
+		const previousActivated = new Set(sessionActivated);
+		const next = computeEnabled(pi.getActiveTools());
+		const nextActivated = new Set(pruneSessionActivated(sessionActivated, next, allTools, disabledNames()));
+		if (sameStringSet(previous, next) && sameStringSet(previousActivated, nextActivated)) return;
+		sessionActivated = nextActivated;
+		installEnabled(next, { persist: true, noticeFrom: previous });
 	}
 
 	function registerLoader(catalog: CatalogEntry[]) {
-		const names = catalog.map((t) => t.name).join("、");
 		const blurbs = catalog.map((t) => `\`${t.name}\`（${t.blurb}）`).join("、");
 		const hasCatalog = catalog.length > 0;
 		pi.registerTool({
 			name: LOADER_TOOL_NAME,
 			label: "Enable Tool",
 			description: hasCatalog
-				? `按精确名激活未启用的扩展工具。按需工具列表：${blurbs}。激活后参数在下一轮生效，禁止同轮连调。`
-				: "按精确名或任务关键词激活未启用的扩展工具。激活后参数在下一轮生效，禁止同轮连调。",
+				? `按精确名激活未启用的扩展工具。未激活：${blurbs}。${ACTIVATION_CONTRACT}`
+				: `按精确名或任务关键词激活未启用的扩展工具。${ACTIVATION_CONTRACT}`,
 			promptSnippet: "按精确名激活未启用的扩展工具",
-			promptGuidelines: [
-				hasCatalog
-					? `需要的扩展工具未激活时，先调用 enable_tool，tool_names 传精确名（${names}）。新工具下一轮生效，禁止同轮连调。`
-					: "需要的扩展工具未激活时，先调用 enable_tool（精确名或 query）。新工具下一轮生效，禁止同轮连调。",
-			],
+			promptGuidelines: [ACTIVATION_CONTRACT],
 			parameters: Type.Object({
 				tool_names: Type.Optional(Type.Array(Type.String(), {
 					description: "Exact names of inactive tools to activate",
@@ -233,22 +283,17 @@ export default function toolsExtension(pi: ExtensionAPI) {
 					};
 				}
 
-				const active = pi.getActiveTools();
-				const added = toEnable
-					.map((t) => t.name)
-					.filter((name) => !active.includes(name));
-				for (const name of added) enabledTools.add(name);
-				// 增量激活，保持 Pi 的 transcript-aware 缓存优化
-				pi.setActiveTools([...new Set([...active, ...added])]);
-				persistSession();
+				const added = toEnable.map((tool) => tool.name);
+				for (const name of added) sessionActivated.add(name);
+				// 不在这里 sendMessage(nextTurn)：那只是排到用户的下一条消息，不会开新回合。
+				// Pi 会在本请求的下一助手回合用 agent.state.tools 刷新快照。
+				const next = computeEnabled(pi.getActiveTools());
+				installEnabled(next, { persist: true });
+				const enabledNow = added.filter((name) => next.has(name));
 
-				const enabledList = added.join(", ");
 				return {
-					content: [{
-						type: "text",
-						text: `Successfully enabled tool(s): ${enabledList}. Their parameter schemas will be available on the next model request. Do not call them in this same assistant message.`,
-					}],
-					details: { requested: params, enabled: added },
+					content: [{ type: "text", text: activationResultText(enabledNow) }],
+					details: { requested: params, enabled: enabledNow },
 				};
 			},
 		});
@@ -357,13 +402,11 @@ export default function toolsExtension(pi: ExtensionAPI) {
 							}
 						}
 
-						// 3. 重新同步当前生效会话工具与 loader catalog
-						const currentActive = pi.getActiveTools();
-						enabledTools = newSessionEnabled(currentActive, allTools, currentCwd, isProjectTrusted);
-						replaceActiveTools();
-						const inactive = getInactiveTools(allTools, Array.from(enabledTools));
-						registerLoader(catalogFrom(inactive));
-						persistSession();
+						// 面板提交的是磁盘策略，清掉本分支增量，避免刚禁用的工具被 enable_tool 记录加回来。
+						const previous = new Set(enabledTools);
+						sessionActivated.clear();
+						configStamp = configFingerprint(currentCwd, isProjectTrusted);
+						installEnabled(computeEnabled(pi.getActiveTools()), { persist: true, noticeFrom: previous });
 						ctx.ui.notify("工具配置已保存并生效", "info");
 					},
 				}),
@@ -371,16 +414,29 @@ export default function toolsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	// 面板或外部配置改动后，下一次请求塞一条一次性通知：不写 session、不改 system prompt。
+	pi.on("context", (event) => {
+		if (!pendingContextNotice) return;
+		const notice = pendingContextNotice;
+		pendingContextNotice = "";
+		try {
+			return { messages: injectToolsNotice(event.messages, notice) };
+		} catch {
+			pendingContextNotice = notice;
+		}
+	});
+
+	pi.on("before_agent_start", async (_event, ctx) => {
 		currentCwd = ctx.cwd;
 		isProjectTrusted = ctx.isProjectTrusted();
-		allTools = pi.getAllTools();
+		reloadConfigIfChanged();
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
 		restoreFromBranch(ctx);
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
-		currentCwd = ctx.cwd;
-		isProjectTrusted = ctx.isProjectTrusted();
 		restoreFromBranch(ctx);
 	});
 }
