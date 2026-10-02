@@ -9,6 +9,8 @@ import { isOnDemand, LOADER_TOOL_NAME } from "./shared.ts";
 export interface StoredToolsState {
 	enabledTools: string[];
 	sessionActivated?: string[];
+	/** Pi 愿意激活的名字。/reload 会丢掉内存里的冻结基线，靠它找回来。 */
+	piBaseline?: string[];
 }
 
 export interface BranchLikeEntry {
@@ -82,14 +84,20 @@ export function applySessionActivations(
 	sessionActivated: Iterable<string>,
 	allTools: readonly ToolInfo[],
 	disabledNames: ReadonlySet<string>,
+	baseline?: Iterable<string>,
 ): Set<string> {
+	const willing = baseline ? new Set(baseline) : undefined;
 	const byName = new Map(allTools.map((tool) => [tool.name, tool]));
 	const next = new Set(diskEnabled);
 	for (const name of sessionActivated) {
+		// 不在 Pi 基线里的名字不是我们收编的，会话增量也不能拉回来。
+		if (willing && !willing.has(name)) continue;
 		const tool = byName.get(name);
 		if (tool && isOnDemand(tool)) next.add(name);
 	}
-	const hasInactive = allTools.some((tool) => isOnDemand(tool) && !next.has(tool.name));
+	const hasInactive = allTools.some(
+		(tool) => isOnDemand(tool) && !next.has(tool.name) && (!willing || willing.has(tool.name)),
+	);
 	if (disabledNames.has(LOADER_TOOL_NAME) || !hasInactive) {
 		next.delete(LOADER_TOOL_NAME);
 	} else {
@@ -117,12 +125,15 @@ export function lastToolsState(entries: readonly BranchLikeEntry[]): StoredTools
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== "tools-config") continue;
 		if (!entry.data || typeof entry.data !== "object") continue;
-		const data = entry.data as { enabledTools?: unknown; sessionActivated?: unknown };
+		const data = entry.data as { enabledTools?: unknown; sessionActivated?: unknown; piBaseline?: unknown };
 		if (!Array.isArray(data.enabledTools)) continue;
 		saved = {
 			enabledTools: data.enabledTools.filter((name): name is string => typeof name === "string"),
 			sessionActivated: Array.isArray(data.sessionActivated)
 				? data.sessionActivated.filter((name): name is string => typeof name === "string")
+				: undefined,
+			piBaseline: Array.isArray(data.piBaseline)
+				? data.piBaseline.filter((name): name is string => typeof name === "string")
 				: undefined,
 		};
 	}
@@ -141,9 +152,13 @@ export function toolsStateChanged(
 	saved: StoredToolsState | undefined,
 	enabled: Iterable<string>,
 	sessionActivated: Iterable<string>,
+	baseline?: Iterable<string>,
 ): boolean {
 	if (!saved) return false;
-	return !sameStringSet(saved.enabledTools, enabled) || !sameStringSet(saved.sessionActivated ?? [], sessionActivated);
+	if (!sameStringSet(saved.enabledTools, enabled) || !sameStringSet(saved.sessionActivated ?? [], sessionActivated)) {
+		return true;
+	}
+	return baseline !== undefined && !sameStringSet(saved.piBaseline ?? [], baseline);
 }
 
 function prependNoticeToContent(content: unknown, notice: string): unknown {

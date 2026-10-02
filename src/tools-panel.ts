@@ -2,12 +2,13 @@ import type { KeybindingsManager, Theme, ThemeColor, ToolInfo } from "@earendil-
 import type { TUI } from "@earendil-works/pi-tui";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ConfigScope } from "./config.ts";
-import { firstSentence, isBuiltin, toolKind, type ToolKind } from "./shared.ts";
+import { firstSentence, isBuiltin, isLocked, isOnDemand, isUpstreamManaged, toolKind, type ToolKind } from "./shared.ts";
 
-const KIND_ORDER: Record<ToolKind, number> = { builtin: 0, loader: 1, user: 2 };
+const KIND_ORDER: Record<ToolKind, number> = { builtin: 0, upstream: 1, loader: 2, user: 3 };
 const KIND_BADGE: Record<ToolKind, string> = {
 	loader: "[core]",
 	builtin: "[builtin]",
+	upstream: "[upstream]",
 	user: "[user]",
 };
 
@@ -37,9 +38,11 @@ function formatToolDescription(tool: ToolInfo): string {
 function formatToolSource(tool: ToolInfo): string {
 	switch (toolKind(tool)) {
 		case "loader":
-			return "按需调度器 (白名单控制 · 可持久化配置)";
+			return "按需调度器 (direct 扩展工具的待命池 · 可持久化配置)";
 		case "builtin":
-			return "内置核心工具 (Pi 官方 settings.json 托管 · 本面板只读)";
+			return "内置核心工具 (Pi 官方 defaultTools 托管 · 本面板只读)";
+		case "upstream":
+			return `上游托管 (${exposureLabel(tool)} · ${upstreamOwner(tool)} · 本面板只读)`;
 		default: {
 			const raw = tool.sourceInfo?.source || "";
 			if (raw.startsWith("npm:")) return raw.slice(4);
@@ -50,6 +53,18 @@ function formatToolSource(tool: ToolInfo): string {
 			return raw || "扩展插件";
 		}
 	}
+}
+
+function exposureLabel(tool: ToolInfo): string {
+	return tool.exposure ?? "direct";
+}
+
+function upstreamOwner(tool: ToolInfo): string {
+	return exposureLabel(tool) === "hidden" ? "已注册但不可达" : "tool_search / codemode 接管";
+}
+
+function outsideBaseline(tool: ToolInfo, baselineNames: ReadonlySet<string> | undefined): boolean {
+	return !!baselineNames && isOnDemand(tool) && !baselineNames.has(tool.name);
 }
 
 function padEndVisible(text: string, width: number): string {
@@ -65,13 +80,13 @@ function rowView(
 	theme: Theme,
 	tool: ToolInfo,
 	selected: boolean,
-	isBuiltinTool: boolean,
+	locked: boolean,
 	isActive: boolean,
 	isInherited: boolean,
 ) {
 	const kind = toolKind(tool);
 
-	if (isBuiltinTool) {
+	if (locked) {
 		const dot = theme.fg(isActive ? "muted" : "dim", isActive ? "● " : "○ ");
 		const name = selected
 			? theme.bold(theme.fg("muted", tool.name))
@@ -149,7 +164,10 @@ export interface ToolsPanelOptions {
 	kb: KeybindingsManager;
 	done: (value: undefined) => void;
 	tools: ToolInfo[];
-	activeBuiltinTools: Set<string>;
+	/** Pi 当前实际激活的工具名，锁定行用它显示真实状态。 */
+	activeNames: Set<string>;
+	/** Pi 愿意激活的名字。不在其中的 direct 扩展工具只读，面板不能拉回。省略则视为全部在基线内。 */
+	baselineNames?: ReadonlySet<string>;
 	initialScope: ConfigScope;
 	canUseProjectScope: boolean;
 	projectDisplayPath: string;
@@ -167,7 +185,8 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 		kb,
 		done,
 		tools,
-		activeBuiltinTools,
+		activeNames,
+		baselineNames,
 		initialScope,
 		canUseProjectScope,
 		projectDisplayPath,
@@ -222,18 +241,18 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 			for (let i = start; i < start + visible; i++) {
 				const tool = tools[i];
 				if (!tool) continue;
-				const isBuiltinTool = isBuiltin(tool);
-				const isActive = isBuiltinTool
-					? activeBuiltinTools.has(tool.name)
+				const locked = isLocked(tool) || outsideBaseline(tool, baselineNames);
+				const isActive = locked
+					? activeNames.has(tool.name)
 					: activeSet.has(tool.name);
 
 				const row = rowView(
 					theme,
 					tool,
 					i === selected,
-					isBuiltinTool,
+					locked,
 					isActive,
-					!isBuiltinTool && isInherited,
+					!locked && isInherited,
 				);
 				list.push(truncateToWidth(
 					`${row.cursor}${row.dot}${padEndVisible(row.name, nameCol + 2)} ${padEndVisible(row.badge, BADGE_COL)}  ${row.status}`,
@@ -243,16 +262,23 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 			while (list.length < listH) list.push("");
 
 			const current = tools[selected];
-			const isBuiltinTool = current ? isBuiltin(current) : false;
-			const isBuiltinActive = isBuiltinTool && current ? activeBuiltinTools.has(current.name) : false;
+			const excluded = current ? outsideBaseline(current, baselineNames) : false;
+			const locked = current ? isLocked(current) || excluded : false;
+			const lockedActive = locked && current ? activeNames.has(current.name) : false;
 
 			let noticeLine: string;
 			if (noticeNotice) {
 				noticeLine = theme.fg(noticeNotice.tone, `  ${noticeNotice.tone === "warning" ? "⚠️  " : "✓  "}${noticeNotice.text}`);
-			} else if (isBuiltinTool) {
-				noticeLine = isBuiltinActive
+			} else if (!current) {
+				noticeLine = "";
+			} else if (isBuiltin(current)) {
+				noticeLine = lockedActive
 					? theme.fg("muted", "  状态: 系统内置核心工具（⊘ 只读锁定 · 需在 settings.json defaultTools 中调整）")
 					: theme.fg("dim", "  状态: 系统内置核心工具（⊘ 未被 Pi 启用 · 需在 settings.json defaultTools 中添加）");
+			} else if (isUpstreamManaged(current)) {
+				noticeLine = theme.fg("dim", `  状态: exposure=${exposureLabel(current)} · ${upstreamOwner(current)}，不进入待命池`);
+			} else if (excluded) {
+				noticeLine = theme.fg("dim", "  状态: Pi 未纳入启动集合（defaultTools / --tools / --exclude-tools · 本面板不能拉回）");
 			} else if (currentScope === "project") {
 				if (!projectCustomized) {
 					noticeLine = theme.fg("dim", `  提示: 标记 ⇡ 为继承全局 · 空格切换将以此为基底派生项目配置 (${projectDisplayPath})`);
@@ -379,11 +405,17 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 			} else if (action === "toggle") {
 				const tool = tools[selected];
 				if (tool) {
-					if (isBuiltin(tool)) {
-						noticeNotice = {
-							text: `内置核心工具 ${tool.name} 由官方托管，请在 settings.json 中调整`,
-							tone: "warning",
-						};
+					if (outsideBaseline(tool, baselineNames)) {
+						noticeNotice = { text: `${tool.name} 不在 Pi 的启动集合里，本面板不能拉回`, tone: "warning" };
+					} else if (isLocked(tool)) {
+						noticeNotice = isBuiltin(tool)
+							? { text: `内置核心工具 ${tool.name} 由 defaultTools 托管，请在 settings.json 中调整`, tone: "warning" }
+							: {
+								text: exposureLabel(tool) === "hidden"
+									? `${tool.name} 的 exposure=hidden，已注册但不可达，不进入待命池`
+									: `${tool.name} 的 exposure=${exposureLabel(tool)}，由 tool_search / codemode 托管`,
+								tone: "warning",
+							};
 					} else {
 						noticeNotice = undefined;
 						if (currentScope === "global") {

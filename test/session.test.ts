@@ -1,23 +1,31 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import type { ToolInfo } from "@earendil-works/pi-coding-agent";
+import type { ToolExposure, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getProjectConfigPath, writeConfigFile } from "../src/config.ts";
-import { getInactiveTools, newSessionEnabled } from "../src/index.ts";
+import { getProjectConfigPath, readConfigFile, writeConfigFile } from "../src/config.ts";
+import { absorbBaseline, applyPolicy, getInactiveTools } from "../src/index.ts";
 import { LOADER_TOOL_NAME } from "../src/shared.ts";
 
-function mockTool(name: string, source: "builtin" | "extension"): ToolInfo {
+function mockTool(
+	name: string,
+	source: "builtin" | "extension",
+	exposure: ToolExposure = "direct",
+): ToolInfo {
 	return {
 		name,
 		description: `Description of ${name}`,
 		parameters: { type: "object", properties: {} },
+		exposure,
 		sourceInfo: source === "builtin" ? { source: "builtin" } : { source: "npm:some-ext" },
-		execute: async () => ({ content: [] }),
-	};
+	} as ToolInfo;
 }
 
-describe("session enabled & sandbox tests", () => {
+function disabledIn(cwd: string): Set<string> {
+	return new Set(readConfigFile(getProjectConfigPath(cwd)) ?? []);
+}
+
+describe("policy: baseline subtraction & upstream ownership", () => {
 	let testDir: string;
 	let projectDir: string;
 	let globalDir: string;
@@ -53,109 +61,145 @@ describe("session enabled & sandbox tests", () => {
 		mockTool("web_search", "extension"),
 		mockTool("url_context", "extension"),
 		mockTool("custom_tool", "extension"),
+		mockTool("mcp__docs__read", "extension", "deferred"),
+		mockTool("mcp__docs__write", "extension", "codemode"),
+		mockTool("secret_tool", "extension", "hidden"),
 	];
 
-	it("strictly respects Pi builtin tools and excludes disabled extension tools", () => {
-		const initialActive = ["read", "bash", "edit", "write"];
+	const piBaseline = [
+		"read",
+		"bash",
+		"edit",
+		"write",
+		"web_search",
+		"url_context",
+		"custom_tool",
+		"mcp__docs__read",
+		"mcp__docs__write",
+		"secret_tool",
+	];
 
-		// Explicitly disable url_context
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, ["url_context"]);
+	it("keeps Pi's own baseline untouched when nothing is disabled", () => {
+		const result = applyPolicy(piBaseline, allMockTools, disabledIn(projectDir), []);
 
-		const result = newSessionEnabled(initialActive, allMockTools, projectDir, true);
+		for (const name of piBaseline) expect(result.has(name)).toBe(true);
+		// 没有待命的 direct 扩展工具，调度器不占 token
+		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
+	});
 
-		// Builtin tools strictly preserved
-		expect(result.has("read")).toBe(true);
-		expect(result.has("bash")).toBe(true);
-		expect(result.has("edit")).toBe(true);
-		expect(result.has("write")).toBe(true);
+	it("only subtracts disabled direct extension tools, and adds the loader back for them", () => {
+		writeConfigFile(getProjectConfigPath(projectDir), ["url_context"]);
 
-		// url_context is disabled
+		const result = applyPolicy(piBaseline, allMockTools, disabledIn(projectDir), []);
+
 		expect(result.has("url_context")).toBe(false);
-		// Other extensions remain active
 		expect(result.has("web_search")).toBe(true);
 		expect(result.has("custom_tool")).toBe(true);
-		// Since url_context is inactive, enable_tool is automatically enabled for on-demand dispatch
 		expect(result.has(LOADER_TOOL_NAME)).toBe(true);
 	});
 
-	it("zero disruption: activates ALL extensions by default when no config file exists (new user experience)", () => {
-		const initialActive = ["read", "bash", "edit", "write"];
+	it("never re-adds tools Pi itself turned off (defaultTools / --tools / --exclude-tools)", () => {
+		writeConfigFile(getProjectConfigPath(projectDir), ["web_search"]);
 
-		// No config file exists (fresh install)
-		const result = newSessionEnabled(initialActive, allMockTools, projectDir, true);
+		// 用户在 defaultTools 里砍掉了 bash 和 web_search：Pi 的基线里就没有它们
+		const baseline = ["read", "edit", "write", "url_context", "custom_tool"];
+		const result = applyPolicy(baseline, allMockTools, disabledIn(projectDir), []);
 
-		// Builtins active
-		expect(result.has("read")).toBe(true);
-		expect(result.has("bash")).toBe(true);
-		expect(result.has("edit")).toBe(true);
-		expect(result.has("write")).toBe(true);
-
-		// All user extensions active! No tools broken for fresh users!
-		expect(result.has("web_search")).toBe(true);
-		expect(result.has("url_context")).toBe(true);
-		expect(result.has("custom_tool")).toBe(true);
-
-		// Because all extensions are already active, enable_tool does not need to consume prompt tokens
-		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
-	});
-
-	it("respects user decision to disable enable_tool itself", () => {
-		const initialActive = ["read", "bash", "edit", "write"];
-
-		// User disables url_context AND enable_tool
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, ["url_context", LOADER_TOOL_NAME]);
-
-		const result = newSessionEnabled(initialActive, allMockTools, projectDir, true);
-
-		expect(result.has("read")).toBe(true);
-		expect(result.has("url_context")).toBe(false);
-		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
-	});
-
-	it("does not restore builtin tools if Pi natively disabled all of them", () => {
-		const initialActive: string[] = [];
-
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, ["web_search"]);
-
-		const result = newSessionEnabled(initialActive, allMockTools, projectDir, true);
-
-		// Native builtins were empty, must remain empty
-		expect(result.has("read")).toBe(false);
 		expect(result.has("bash")).toBe(false);
-
-		// web_search was disabled, other extensions enabled
 		expect(result.has("web_search")).toBe(false);
-		expect(result.has("url_context")).toBe(true);
-		expect(result.has("custom_tool")).toBe(true);
+		expect(result.has("read")).toBe(true);
 	});
 
-	it("prioritizes project config over global config for extension disabled list", () => {
-		const initialActive = ["read", "bash"];
+	it("leaves upstream-managed exposures completely alone", () => {
+		// 即便它们出现在 disabledTools 里也不收编：不是我们的池子
+		writeConfigFile(getProjectConfigPath(projectDir), [
+			"mcp__docs__read",
+			"mcp__docs__write",
+			"secret_tool",
+		]);
 
-		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, ["web_search"]);
+		const result = applyPolicy(piBaseline, allMockTools, disabledIn(projectDir), []);
 
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, ["url_context"]);
+		expect(result.has("mcp__docs__read")).toBe(true);
+		expect(result.has("mcp__docs__write")).toBe(true);
+		expect(result.has("secret_tool")).toBe(true);
+		// 上游工具不撑起调度器：没有待命的 direct 扩展工具
+		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
+	});
 
-		const result = newSessionEnabled(initialActive, allMockTools, projectDir, true);
+	it("re-enables a subtracted tool against the frozen baseline, not the already-reduced active set", () => {
+		const frozen = ["read", "bash", "edit", "write", "web_search", "url_context"];
+		writeConfigFile(getProjectConfigPath(projectDir), ["url_context"]);
 
-		// Project config disables url_context, not web_search
+		const subtracted = applyPolicy(frozen, allMockTools, disabledIn(projectDir), []);
+		expect(subtracted.has("url_context")).toBe(false);
+		// custom_tool 从未进过 Pi 的启动集合，减法结果里也不该出现
+		expect(subtracted.has("custom_tool")).toBe(false);
+
+		writeConfigFile(getProjectConfigPath(projectDir), []);
+		const restored = applyPolicy(frozen, allMockTools, disabledIn(projectDir), []);
+		expect(restored.has("url_context")).toBe(true);
+		expect(restored.has("custom_tool")).toBe(false);
+		expect(restored.has(LOADER_TOOL_NAME)).toBe(false);
+	});
+
+	it("does not let a session delta revive a tool Pi never put in the baseline", () => {
+		const frozen = ["read", "bash", "web_search"];
+		const result = applyPolicy(frozen, allMockTools, new Set(["web_search"]), ["web_search", "custom_tool"]);
+
 		expect(result.has("web_search")).toBe(true);
-		expect(result.has("url_context")).toBe(false);
+		expect(result.has("custom_tool")).toBe(false);
 	});
 
-	it("guarantees getInactiveTools dispatcher pool contains ONLY extensions, NEVER builtins or loader", () => {
+	it("keeps subtracted names in the frozen baseline and absorbs only tools Pi activates later", () => {
+		const frozen = absorbBaseline(undefined, ["read", "web_search", "url_context"], undefined);
+		const written = new Set(["read", "web_search", LOADER_TOOL_NAME]);
+		const next = absorbBaseline(frozen, ["read", "web_search", LOADER_TOOL_NAME, "late_direct"], written);
+
+		expect(next.has("url_context")).toBe(true);
+		expect(next.has("late_direct")).toBe(true);
+		expect(next.has(LOADER_TOOL_NAME)).toBe(false);
+	});
+
+	it("reload unions the saved baseline with whatever Pi currently has active", () => {
+		const reloaded = absorbBaseline(
+			["read", "web_search", "url_context"],
+			["read", "web_search", "late_direct"],
+			undefined,
+		);
+
+		expect(reloaded.has("url_context")).toBe(true);
+		expect(reloaded.has("late_direct")).toBe(true);
+	});
+
+	it("re-applies the branch session delta on top of the subtraction", () => {
+		writeConfigFile(getProjectConfigPath(projectDir), ["url_context"]);
+
+		const result = applyPolicy(piBaseline, allMockTools, disabledIn(projectDir), ["url_context"]);
+
+		expect(result.has("url_context")).toBe(true);
+		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
+	});
+
+	it("respects the user disabling enable_tool itself", () => {
+		writeConfigFile(getProjectConfigPath(projectDir), ["url_context", LOADER_TOOL_NAME]);
+
+		const result = applyPolicy(piBaseline, allMockTools, disabledIn(projectDir), []);
+
+		expect(result.has("url_context")).toBe(false);
+		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
+	});
+
+	it("getInactiveTools pool contains ONLY activatable extensions, never builtins, loader or upstream tools", () => {
 		const activeNames = ["read", "bash", "edit", "write", LOADER_TOOL_NAME, "web_search"];
 		const inactive = getInactiveTools(allMockTools, activeNames);
 
-		// Should only contain url_context and custom_tool
+		// 上游 exposure（deferred / codemode / hidden）不归本扩展待命池
 		expect(inactive.map((t) => t.name).sort()).toEqual(["custom_tool", "url_context"]);
-		expect(inactive.some((t) => t.name === "read")).toBe(false);
-		expect(inactive.some((t) => t.name === "bash")).toBe(false);
-		expect(inactive.some((t) => t.name === LOADER_TOOL_NAME)).toBe(false);
+	});
+
+	it("getInactiveTools ignores on-demand tools Pi never included", () => {
+		const inactive = getInactiveTools(allMockTools, ["read", "web_search"], ["read", "web_search", "url_context"]);
+		expect(inactive.map((tool) => tool.name)).toEqual(["url_context"]);
 	});
 });

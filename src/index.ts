@@ -1,10 +1,12 @@
 /**
  * pi-tools: 按需启用扩展工具
- * 1. 内置工具归 Pi，本扩展不改、不持久化。
- * 2. 扩展工具默认全开，disabledTools 是磁盘失活策略。
- * 3. enable_tool 只追加本分支的会话增量，不写回配置文件。
- * 4. 恢复会话时磁盘策略优先；旧的 enabledTools 绝对快照不能盖住外部修改。
- * 5. 工具在同一用户请求的下一助手回合生效（Pi prepareNextTurn 会刷新快照）。
+ * 1. 内置工具归 Pi（defaultTools / --tools），本扩展不改、不持久化。
+ * 2. exposure 为 deferred / codemode / hidden 的工具归上游（tool_search / codemode 脚本），本扩展一律不碰。
+ * 3. 本扩展只做减法：冻结 Pi 的启动集合，再从里面收编 direct 扩展工具。disabledTools 是磁盘失活策略。
+ *    重新启用必须相对这份冻结集合，不能相对已经减过的 active。
+ * 4. enable_tool 只追加本分支的会话增量，不写回配置文件。
+ * 5. 恢复会话时磁盘策略优先；旧的 enabledTools 绝对快照不能盖住外部修改。
+ * 6. 工具在同一用户请求的下一助手回合生效（Pi prepareNextTurn 会刷新快照）。
  *    同一条助手消息里的并行调用物理上拿不到新 schema，所以禁止同条连调，而不是让用户再发一条。
  */
 
@@ -37,7 +39,6 @@ import {
 } from "./config.ts";
 import {
 	firstSentence,
-	isBuiltin,
 	isOnDemand,
 	isSupported,
 	LOADER_TOOL_NAME,
@@ -62,51 +63,50 @@ export function catalogFrom(tools: ToolInfo[]): CatalogEntry[] {
 }
 
 /**
- * 确定新会话中应该激活的工具集合：
- * 1. 内置核心工具：严格保留 Pi 启动时原生传入且受支持的内置工具，不多加、不少减。
- * 2. 扩展工具：主动差量失活机制（Opt-out）。无配置时全部扩展工具默认激活；
- *    仅排除列在 disabledTools 中的工具。
- * 3. 调度器 enable_tool：
- *    当且仅当 enable_tool 自身未被失活，且当前存在被失活的扩展工具时激活（0 token 冗余）；
- *    若所有扩展工具都已处于激活状态，无需激活调度器。
+ * 在 Pi 自己的启动集合上做减法，得到本会话应激活的工具集合。
+ *
+ * baseline 必须是 Pi 愿意激活的集合（defaultTools / --tools / --exclude-tools / 注册即激活），
+ * 不能是本扩展 setActiveTools 之后的 active：那份已经减过，重新启用会加不回来。
+ * 本扩展只把「基线里的可声明扩展工具 ∩ disabledTools」拿掉，再补回仍在基线内的会话增量。
+ * 因此 Pi 或用户显式关掉、从未进过基线的工具不会被拉回来。
  */
-export function newSessionEnabled(
-	initialActiveTools: string[],
-	allTools: ToolInfo[],
-	cwd: string,
-	trusted: boolean,
+export function applyPolicy(
+	baseline: Iterable<string>,
+	allTools: readonly ToolInfo[],
+	disabled: ReadonlySet<string>,
+	sessionActivated: Iterable<string>,
 ): Set<string> {
-	const toolMap = new Map(allTools.map((t) => [t.name, t]));
-	const next = new Set<string>();
-
-	// 1. 内置工具：保留 Pi 初始激活且受支持的内置核心工具
-	for (const name of initialActiveTools) {
-		const tool = toolMap.get(name);
-		if (tool && isBuiltin(tool) && isSupported(tool)) {
-			next.add(name);
-		}
+	const byName = new Map(allTools.map((tool) => [tool.name, tool]));
+	const willing = new Set(baseline);
+	const next = new Set(willing);
+	for (const name of disabled) {
+		const tool = byName.get(name);
+		if (tool && isOnDemand(tool)) next.delete(name);
 	}
+	const delta = [...sessionActivated].filter((name) => willing.has(name));
+	return applySessionActivations(next, delta, allTools, disabled, willing);
+}
 
-	// 2. 扩展工具：读取当前生效的 disabledTools 配置（失活名单）
-	const config = resolveEffectiveConfig(cwd, trusted);
-	const disabledSet = new Set(config.disabledTools ?? []);
-
-	for (const tool of allTools) {
-		if (isOnDemand(tool) && !disabledSet.has(tool.name)) {
-			next.add(tool.name);
-		}
+/**
+ * 维护 Pi 的愿意集合。
+ * 第一次观察且我们还没写过 active：当前 active 就是 Pi 的启动集合。
+ * 之后只并入「不是我们写进去」的名字（迟到注册、tool_search 加载）。
+ * 我们减掉的名字留在已冻结的集合里，这样磁盘重新启用还能加回来。
+ */
+export function absorbBaseline(
+	baseline: Iterable<string> | undefined,
+	active: Iterable<string>,
+	writtenByUs: Iterable<string> | undefined,
+): Set<string> {
+	const next = new Set(baseline ?? []);
+	const written = writtenByUs ? new Set(writtenByUs) : undefined;
+	if (baseline === undefined && !written) {
+		for (const name of active) next.add(name);
+		return next;
 	}
-
-	// 3. 调度器：若未被失活，且存在未激活的扩展工具时启用
-	if (!disabledSet.has(LOADER_TOOL_NAME)) {
-		const hasInactiveExtensions = allTools.some(
-			(tool) => isOnDemand(tool) && !next.has(tool.name),
-		);
-		if (hasInactiveExtensions) {
-			next.add(LOADER_TOOL_NAME);
-		}
+	for (const name of active) {
+		if (!written || !written.has(name)) next.add(name);
 	}
-
 	return next;
 }
 
@@ -114,9 +114,15 @@ export function newSessionEnabled(
  * 获取可被模型动态激活的未启用工具列表。
  * 安全保障：调度池仅包含扩展工具，绝对排除内置核心工具及调度器自身。
  */
-export function getInactiveTools(allTools: ToolInfo[], activeNames: string[]): ToolInfo[] {
+export function getInactiveTools(
+	allTools: readonly ToolInfo[],
+	activeNames: readonly string[],
+	baseline?: Iterable<string>,
+): ToolInfo[] {
+	const willing = baseline ? new Set(baseline) : undefined;
+	const active = new Set(activeNames);
 	return allTools.filter(
-		(t) => isOnDemand(t) && !activeNames.includes(t.name),
+		(tool) => isOnDemand(tool) && !active.has(tool.name) && (!willing || willing.has(tool.name)),
 	);
 }
 
@@ -150,25 +156,45 @@ export default function toolsExtension(pi: ExtensionAPI) {
 	let isProjectTrusted: boolean = true;
 	let configStamp = "";
 	let pendingContextNotice = "";
+	let loaderDescription = "";
+	/** Pi 愿意激活的名字。第一次 setActiveTools 之前冻结，之后只并入 Pi 后来自己激活的工具。 */
+	let piBaseline: Set<string> | undefined;
+	/** 我们上一次写进 setActiveTools 的名字。用来区分「Pi 后来激活的」和「我们减掉的」。 */
+	let writtenActive: Set<string> | undefined;
 
 	function disabledNames(): Set<string> {
 		return new Set(resolveEffectiveConfig(currentCwd, isProjectTrusted).disabledTools ?? []);
 	}
 
-	function computeEnabled(initialActive: string[]): Set<string> {
+	function ensureBaseline(): Set<string> {
+		piBaseline = absorbBaseline(piBaseline, pi.getActiveTools(), writtenActive);
+		return piBaseline;
+	}
+
+	function seedBaseline(saved: StoredToolsState | undefined, reload: boolean) {
+		const active = pi.getActiveTools();
+		if (piBaseline) {
+			piBaseline = absorbBaseline(piBaseline, active, writtenActive);
+			return;
+		}
+		// /reload 会新建扩展实例，此时 active 已是我们减过的集合。用上次持久化的基线找回来。
+		if (reload && saved?.piBaseline && saved.piBaseline.length > 0) {
+			piBaseline = absorbBaseline(saved.piBaseline, active, undefined);
+			return;
+		}
+		piBaseline = absorbBaseline(undefined, active, writtenActive);
+	}
+
+	function computeEnabled(baseline: Iterable<string>): Set<string> {
 		allTools = pi.getAllTools();
-		return applySessionActivations(
-			newSessionEnabled(initialActive, allTools, currentCwd, isProjectTrusted),
-			sessionActivated,
-			allTools,
-			disabledNames(),
-		);
+		return applyPolicy(baseline, allTools, disabledNames(), sessionActivated);
 	}
 
 	function persistSession() {
 		const state: StoredToolsState = {
 			enabledTools: Array.from(enabledTools),
 			sessionActivated: Array.from(sessionActivated),
+			piBaseline: piBaseline ? Array.from(piBaseline) : undefined,
 		};
 		pi.appendEntry<StoredToolsState>("tools-config", state);
 	}
@@ -179,7 +205,7 @@ export default function toolsExtension(pi: ExtensionAPI) {
 	}
 
 	function syncLoader() {
-		const inactive = getInactiveTools(allTools, Array.from(enabledTools));
+		const inactive = getInactiveTools(allTools, Array.from(enabledTools), piBaseline);
 		registerLoader(catalogFrom(inactive));
 	}
 
@@ -194,12 +220,14 @@ export default function toolsExtension(pi: ExtensionAPI) {
 		enabledTools = next;
 		sessionActivated = new Set(pruneSessionActivated(sessionActivated, enabledTools, allTools, disabledNames()));
 		syncLoader();
+		// 先记下我们要写的集合，避免 setActiveTools 触发的后续观察把这次写入当成 Pi 的新决定。
+		writtenActive = new Set(enabledTools);
 		replaceActiveTools();
 		if (options.noticeFrom) queueToolsNotice(previous, enabledTools);
 		if (options.persist) persistSession();
 	}
 
-	function restoreFromBranch(ctx: ExtensionContext) {
+	function restoreFromBranch(ctx: ExtensionContext, reload = false) {
 		currentCwd = ctx.cwd;
 		isProjectTrusted = ctx.isProjectTrusted();
 		allTools = pi.getAllTools();
@@ -210,23 +238,35 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			data: "data" in entry ? entry.data : undefined,
 		})));
 		sessionActivated = new Set(activationsFromSaved(saved));
-		const next = computeEnabled(pi.getActiveTools());
-		const persist = toolsStateChanged(saved, next, pruneSessionActivated(sessionActivated, next, allTools, disabledNames()));
+		seedBaseline(saved, reload);
+		const next = computeEnabled(piBaseline!);
+		const activated = pruneSessionActivated(sessionActivated, next, allTools, disabledNames());
+		// 没有持久化过基线时写一条，否则 /reload 只能看到已经减过的 active。
+		const persist = toolsStateChanged(saved, next, activated, piBaseline) || !saved?.piBaseline;
 		installEnabled(next, { persist });
 		configStamp = configFingerprint(currentCwd, isProjectTrusted);
 	}
 
-	/** 外部改了 pi-tools.json：下一条消息前按磁盘重算，保留尚未被磁盘覆盖的 enable_tool 增量。 */
+	/** 外部改了 pi-tools.json，或 Pi 迟到激活了工具：下一条消息前按冻结基线重算。 */
 	function reloadConfigIfChanged() {
 		const stamp = configFingerprint(currentCwd, isProjectTrusted);
-		if (stamp === configStamp) return;
+		const before = piBaseline ? new Set(piBaseline) : undefined;
+		const baseline = ensureBaseline();
+		const baselineChanged = !before || !sameStringSet(before, baseline);
+		if (stamp === configStamp && !baselineChanged) return;
 		configStamp = stamp;
 		allTools = pi.getAllTools();
 		const previous = new Set(enabledTools);
 		const previousActivated = new Set(sessionActivated);
-		const next = computeEnabled(pi.getActiveTools());
+		const next = computeEnabled(baseline);
 		const nextActivated = new Set(pruneSessionActivated(sessionActivated, next, allTools, disabledNames()));
-		if (sameStringSet(previous, next) && sameStringSet(previousActivated, nextActivated)) return;
+		const live = new Set(pi.getActiveTools());
+		// live 比 enabledTools 多出来的名字，是 Pi 在我们上次写入之后激活的（例如迟到的 direct MCP）。
+		if (
+			sameStringSet(previous, next) &&
+			sameStringSet(previousActivated, nextActivated) &&
+			sameStringSet(live, next)
+		) return;
 		sessionActivated = nextActivated;
 		installEnabled(next, { persist: true, noticeFrom: previous });
 	}
@@ -234,12 +274,20 @@ export default function toolsExtension(pi: ExtensionAPI) {
 	function registerLoader(catalog: CatalogEntry[]) {
 		const blurbs = catalog.map((t) => `\`${t.name}\`（${t.blurb}）`).join("、");
 		const hasCatalog = catalog.length > 0;
+		const description = hasCatalog
+			? `按精确名激活未启用的扩展工具。未激活：${blurbs}。${ACTIVATION_CONTRACT}`
+			: `按精确名或任务关键词激活未启用的扩展工具。${ACTIVATION_CONTRACT}`;
+		// 重注册会触发 Pi 重建整个工具注册表与 system prompt，目录没变就不动。
+		if (description === loaderDescription) return;
+		loaderDescription = description;
 		pi.registerTool({
 			name: LOADER_TOOL_NAME,
 			label: "Enable Tool",
-			description: hasCatalog
-				? `按精确名激活未启用的扩展工具。未激活：${blurbs}。${ACTIVATION_CONTRACT}`
-				: `按精确名或任务关键词激活未启用的扩展工具。${ACTIVATION_CONTRACT}`,
+			description,
+			// 纯调度器：模型直接调用，不需要被 codemode 脚本嵌套调用。
+			exposure: "model-only",
+			// 是否常驻完全由 applySessionActivations 决定，不靠注册即激活。
+			defaultActive: false,
 			promptSnippet: "按精确名激活未启用的扩展工具",
 			promptGuidelines: [ACTIVATION_CONTRACT],
 			parameters: Type.Object({
@@ -252,7 +300,8 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			}),
 			async execute(_toolCallId, params) {
 				allTools = pi.getAllTools();
-				const inactive = getInactiveTools(allTools, pi.getActiveTools());
+				const baseline = ensureBaseline();
+				const inactive = getInactiveTools(allTools, pi.getActiveTools(), baseline);
 				const toEnable: ToolInfo[] = [];
 
 				if (params.tool_names && params.tool_names.length > 0) {
@@ -287,7 +336,7 @@ export default function toolsExtension(pi: ExtensionAPI) {
 				for (const name of added) sessionActivated.add(name);
 				// 不在这里 sendMessage(nextTurn)：那只是排到用户的下一条消息，不会开新回合。
 				// Pi 会在本请求的下一助手回合用 agent.state.tools 刷新快照。
-				const next = computeEnabled(pi.getActiveTools());
+				const next = computeEnabled(baseline);
 				installEnabled(next, { persist: true });
 				const enabledNow = added.filter((name) => next.has(name));
 
@@ -312,6 +361,7 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			currentCwd = ctx.cwd;
 			isProjectTrusted = ctx.isProjectTrusted();
 			allTools = pi.getAllTools();
+			const baseline = ensureBaseline();
 			const tools = sortTools(allTools.filter(isSupported));
 
 			const effective = resolveEffectiveConfig(currentCwd, isProjectTrusted);
@@ -319,16 +369,13 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			const projectDisplay = ".pi/pi-tools.json";
 			const globalDisplay = formatDisplayPath(getGlobalConfigPath());
 
-			// 当前在 Pi 中活跃的系统内置核心工具
+			// 当前在 Pi 中活跃的工具（锁定行用它显示真实状态）
 			const activeNames = new Set(pi.getActiveTools());
-			const activeBuiltinTools = new Set(
-				allTools
-					.filter((t) => isBuiltin(t) && activeNames.has(t.name))
-					.map((t) => t.name),
-			);
 
-			// 可被本面板管理的全部工具（非内置工具 + loader）
-			const manageableTools = tools.filter((t) => isOnDemand(t) || t.name === LOADER_TOOL_NAME);
+			// 只管理基线里的 direct 扩展工具和调度器。Pi 没放进来的不进草稿，避免显示成已启用。
+			const manageableTools = tools.filter(
+				(tool) => tool.name === LOADER_TOOL_NAME || (isOnDemand(tool) && baseline.has(tool.name)),
+			);
 
 			const globalDisabledList = readScopeConfig("global", currentCwd) ?? [];
 			const globalDisabledSet = new Set(globalDisabledList);
@@ -359,7 +406,8 @@ export default function toolsExtension(pi: ExtensionAPI) {
 					kb,
 					done,
 					tools,
-					activeBuiltinTools,
+					activeNames,
+					baselineNames: baseline,
 					initialScope,
 					canUseProjectScope: isProjectTrusted,
 					projectDisplayPath: projectDisplay,
@@ -406,7 +454,7 @@ export default function toolsExtension(pi: ExtensionAPI) {
 						const previous = new Set(enabledTools);
 						sessionActivated.clear();
 						configStamp = configFingerprint(currentCwd, isProjectTrusted);
-						installEnabled(computeEnabled(pi.getActiveTools()), { persist: true, noticeFrom: previous });
+						installEnabled(computeEnabled(ensureBaseline()), { persist: true, noticeFrom: previous });
 						ctx.ui.notify("工具配置已保存并生效", "info");
 					},
 				}),
@@ -432,8 +480,8 @@ export default function toolsExtension(pi: ExtensionAPI) {
 		reloadConfigIfChanged();
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		restoreFromBranch(ctx);
+	pi.on("session_start", async (event, ctx) => {
+		restoreFromBranch(ctx, event.reason === "reload");
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {

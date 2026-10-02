@@ -16,9 +16,11 @@ pi install git:github.com/hyperlook/pi-tools
 
 ## 它是怎么工作的？
 
-- **内置工具常驻**：`read`、`bash`、`edit`、`write` 等 Pi 原生核心工具由pi 命令自行管理。
+- **内置工具常驻**：`read`、`bash`、`edit`、`write` 等 Pi 原生核心工具由 pi 命令自行管理（`settings.json` 的 `defaultTools`）。
 - **扩展工具按需激活**：未激活的扩展工具收敛为待命目录，当任务需要时，模型会自动调用 `enable_tool` 增量激活。新工具在**同一次用户请求的下一助手回合**带上完整 Schema，不用用户再发一条消息。
 - **零破坏开箱即用**：首次安装默认全量可用，仅将你主动在面板中停用的工具转入待命池。
+- **不抢 Pi 的决定**：本扩展只在 Pi 自己的启动集合上做减法，`defaultTools` / `--tools` / `--exclude-tools` 关掉的工具不会被重新拉回。
+- **不越权上游工具**：`deferred` / `codemode` 由 Pi 1.0 的 `tool_search` 与 `codemode` 接管，`hidden` 只是注册了但不可达。面板中以 `[upstream]` 只读展示，不进入待命池。需要 Pi 1.0+。
 
 ---
 

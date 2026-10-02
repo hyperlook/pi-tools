@@ -1,15 +1,15 @@
 import { describe, expect, it } from "bun:test";
-import type { ToolInfo } from "@earendil-works/pi-coding-agent";
+import type { ToolExposure, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { createToolsPanel, type ToolsPanelSaveResult } from "../src/tools-panel.ts";
 
-function mockTool(name: string, isBuiltin: boolean): ToolInfo {
+function mockTool(name: string, isBuiltin: boolean, exposure: ToolExposure = "direct"): ToolInfo {
 	return {
 		name,
 		description: `Description of ${name}`,
 		parameters: { type: "object", properties: {} },
+		exposure,
 		sourceInfo: isBuiltin ? { source: "builtin" } : { source: "npm:test" },
-		execute: async () => ({ content: [] }),
-	};
+	} as ToolInfo;
 }
 
 const mockTheme = {
@@ -34,12 +34,13 @@ describe("tools panel interactions (Draft & Commit model)", () => {
 	const tools: ToolInfo[] = [
 		mockTool("read", true),
 		mockTool("bash", true),
+		mockTool("mcp__docs__read", false, "deferred"),
 		mockTool("web_search", false),
 		mockTool("url_context", false),
 	];
 
 	it("renders active vs inactive state for builtin tools with locked indicator", () => {
-		const activeBuiltinTools = new Set(["read"]);
+		const activeNames = new Set(["read"]);
 		const initialGlobalEnabled = new Set(["web_search"]);
 
 		const panel = createToolsPanel({
@@ -48,7 +49,7 @@ describe("tools panel interactions (Draft & Commit model)", () => {
 			kb: mockKb,
 			done: () => {},
 			tools,
-			activeBuiltinTools,
+			activeNames,
 			initialScope: "project",
 			canUseProjectScope: true,
 			projectDisplayPath: ".pi/pi-tools.json",
@@ -73,8 +74,62 @@ describe("tools panel interactions (Draft & Commit model)", () => {
 		expect(fullText).toContain("继承全局");
 	});
 
+	it("locks upstream-managed exposures and explains who owns them", () => {
+		const panel = createToolsPanel({
+			tui: mockTui,
+			theme: mockTheme,
+			kb: mockKb,
+			done: () => {},
+			tools,
+			activeNames: new Set(["read", "mcp__docs__read"]),
+			initialScope: "global",
+			canUseProjectScope: true,
+			projectDisplayPath: ".pi/pi-tools.json",
+			globalDisplayPath: "~/.pi/agent/pi-tools.json",
+			initialGlobalEnabled: new Set(["web_search", "url_context"]),
+			initialProjectEnabled: undefined,
+			onSave: () => {},
+		});
+
+		expect(panel.render(100).join("\n")).toContain("[upstream]");
+
+		// 光标移到 deferred 工具（index 2），空格应被拒绝并说明上游归属
+		panel.handleInput("j");
+		panel.handleInput("j");
+		panel.handleInput(" ");
+		expect(panel.render(100).join("\n")).toContain("exposure=deferred，由 tool_search / codemode 托管");
+	});
+
+	it("locks tools Pi left out of its baseline and refuses to pull them back", () => {
+		const panel = createToolsPanel({
+			tui: mockTui,
+			theme: mockTheme,
+			kb: mockKb,
+			done: () => {},
+			tools,
+			activeNames: new Set(["read", "bash"]),
+			baselineNames: new Set(["read", "bash", "url_context"]),
+			initialScope: "global",
+			canUseProjectScope: true,
+			projectDisplayPath: ".pi/pi-tools.json",
+			globalDisplayPath: "~/.pi/agent/pi-tools.json",
+			initialGlobalEnabled: new Set(["web_search", "url_context"]),
+			initialProjectEnabled: undefined,
+			onSave: () => {},
+		});
+
+		// read, bash, deferred, web_search：光标移到不在基线里的 web_search
+		panel.handleInput("j");
+		panel.handleInput("j");
+		panel.handleInput("j");
+		expect(panel.render(100).join("\n")).toContain("Pi 未纳入启动集合");
+
+		panel.handleInput(" ");
+		expect(panel.render(100).join("\n")).toContain("web_search 不在 Pi 的启动集合里，本面板不能拉回");
+	});
+
 	it("refuses to toggle builtin tool and shows friendly warning notice", () => {
-		const activeBuiltinTools = new Set(["read", "bash"]);
+		const activeNames = new Set(["read", "bash"]);
 		let saved: ToolsPanelSaveResult | undefined;
 
 		const panel = createToolsPanel({
@@ -83,7 +138,7 @@ describe("tools panel interactions (Draft & Commit model)", () => {
 			kb: mockKb,
 			done: () => {},
 			tools,
-			activeBuiltinTools,
+			activeNames,
 			initialScope: "project",
 			canUseProjectScope: true,
 			projectDisplayPath: ".pi/pi-tools.json",
@@ -102,7 +157,7 @@ describe("tools panel interactions (Draft & Commit model)", () => {
 		expect(saved).toBeUndefined();
 		const lines = panel.render(100);
 		const fullText = lines.join("\n");
-		expect(fullText).toContain("内置核心工具 read 由官方托管，请在 settings.json 中调整");
+		expect(fullText).toContain("内置核心工具 read 由 defaultTools 托管，请在 settings.json 中调整");
 	});
 
 	it("forks project config from global baseline on edit and saves on Enter", () => {
@@ -120,7 +175,7 @@ describe("tools panel interactions (Draft & Commit model)", () => {
 				closed = true;
 			},
 			tools,
-			activeBuiltinTools: new Set(["read"]),
+			activeNames: new Set(["read"]),
 			initialScope: "project",
 			canUseProjectScope: true,
 			projectDisplayPath: ".pi/pi-tools.json",
@@ -132,7 +187,8 @@ describe("tools panel interactions (Draft & Commit model)", () => {
 			},
 		});
 
-		// 光标移到 web_search (index 2)
+		// 光标移到 web_search (index 3)
+		panel.handleInput("j");
 		panel.handleInput("j");
 		panel.handleInput("j");
 
@@ -171,7 +227,7 @@ describe("tools panel interactions (Draft & Commit model)", () => {
 				closed = true;
 			},
 			tools,
-			activeBuiltinTools: new Set(["read"]),
+			activeNames: new Set(["read"]),
 			initialScope: "global",
 			canUseProjectScope: true,
 			projectDisplayPath: ".pi/pi-tools.json",
@@ -183,7 +239,8 @@ describe("tools panel interactions (Draft & Commit model)", () => {
 			},
 		});
 
-		// 光标移到 web_search (index 2)
+		// 光标移到 web_search (index 3)
+		panel.handleInput("j");
 		panel.handleInput("j");
 		panel.handleInput("j");
 
@@ -209,7 +266,7 @@ describe("tools panel interactions (Draft & Commit model)", () => {
 				closed = true;
 			},
 			tools,
-			activeBuiltinTools: new Set(["read"]),
+			activeNames: new Set(["read"]),
 			initialScope: "project",
 			canUseProjectScope: true,
 			projectDisplayPath: ".pi/pi-tools.json",
