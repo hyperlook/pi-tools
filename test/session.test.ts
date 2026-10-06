@@ -1,205 +1,115 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import type { ToolExposure, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { mkdirSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { getProjectConfigPath, readConfigFile, writeConfigFile } from "../src/config.ts";
-import { absorbBaseline, applyPolicy, getInactiveTools } from "../src/index.ts";
-import { LOADER_TOOL_NAME } from "../src/shared.ts";
+import { lastPolicyState, planPolicy, sameNames, STATE_ENTRY, stateEqual } from "../src/policy.ts";
+import { modeOf, nextMode, type ToolModes } from "../src/shared.ts";
 
-function mockTool(
-	name: string,
-	source: "builtin" | "extension",
-	exposure: ToolExposure = "direct",
-): ToolInfo {
-	return {
-		name,
-		description: `Description of ${name}`,
-		parameters: { type: "object", properties: {} },
-		exposure,
-		sourceInfo: source === "builtin" ? { source: "builtin" } : { source: "npm:some-ext" },
-	} as ToolInfo;
+function tool(name: string, exposure: ToolExposure = "deferred", source = "npm:example"): ToolInfo {
+	return { name, exposure, description: name, parameters: { type: "object" }, sourceInfo: { source } };
 }
+const tools = [tool("read", "direct", "builtin"), tool("bash", "direct", "builtin"),
+	tool("tool_search", "model-only"), tool("codemode", "model-only"), tool("docs"),
+	tool("images", "codemode"), tool("legacy", "direct"), tool("ask", "model-only"), tool("secret", "hidden")];
 
-function disabledIn(cwd: string): Set<string> {
-	return new Set(readConfigFile(getProjectConfigPath(cwd)) ?? []);
-}
-
-describe("policy: baseline subtraction & upstream ownership", () => {
-	let testDir: string;
-	let projectDir: string;
-	let globalDir: string;
-	let origAgentDir: string | undefined;
-
-	beforeEach(() => {
-		testDir = join(tmpdir(), `pi-session-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		projectDir = join(testDir, "project");
-		globalDir = join(testDir, "agent");
-		mkdirSync(projectDir, { recursive: true });
-		mkdirSync(globalDir, { recursive: true });
-
-		origAgentDir = process.env.PI_CODING_AGENT_DIR;
-		process.env.PI_CODING_AGENT_DIR = globalDir;
-		delete process.env.PI_TOOLS_CONFIG;
+describe("native loading policy", () => {
+	it("does not touch the startup loadout without explicit preferences", () => {
+		const active = ["read", "legacy", "docs"];
+		expect([...planPolicy(active, tools, {}).active]).toEqual(active);
 	});
-
-	afterEach(() => {
-		if (origAgentDir !== undefined) {
-			process.env.PI_CODING_AGENT_DIR = origAgentDir;
-		} else {
-			delete process.env.PI_CODING_AGENT_DIR;
-		}
-		rmSync(testDir, { recursive: true, force: true });
+	it("cycles three modes with an explicit opt-out", () => {
+		expect(nextMode("inherit")).toBe("always");
+		expect(nextMode("always")).toBe("on-demand");
+		expect(nextMode("on-demand")).toBe("inherit");
+		expect(modeOf({}, "docs")).toBe("inherit");
 	});
-
-	const allMockTools: ToolInfo[] = [
-		mockTool("read", "builtin"),
-		mockTool("bash", "builtin"),
-		mockTool("edit", "builtin"),
-		mockTool("write", "builtin"),
-		mockTool(LOADER_TOOL_NAME, "builtin"),
-		mockTool("web_search", "extension"),
-		mockTool("url_context", "extension"),
-		mockTool("custom_tool", "extension"),
-		mockTool("mcp__docs__read", "extension", "deferred"),
-		mockTool("mcp__docs__write", "extension", "codemode"),
-		mockTool("secret_tool", "extension", "hidden"),
-	];
-
-	const piBaseline = [
-		"read",
-		"bash",
-		"edit",
-		"write",
-		"web_search",
-		"url_context",
-		"custom_tool",
-		"mcp__docs__read",
-		"mcp__docs__write",
-		"secret_tool",
-	];
-
-	it("keeps Pi's own baseline untouched when nothing is disabled", () => {
-		const result = applyPolicy(piBaseline, allMockTools, disabledIn(projectDir), []);
-
-		for (const name of piBaseline) expect(result.has(name)).toBe(true);
-		// 没有待命的 direct 扩展工具，调度器不占 token
-		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
+	it("activates a native tool when switching to always", () => {
+		const plan = planPolicy(["read"], tools, { docs: "always" });
+		expect([...plan.active]).toEqual(["read", "docs"]);
 	});
-
-	it("only subtracts disabled direct extension tools, and adds the loader back for them", () => {
-		writeConfigFile(getProjectConfigPath(projectDir), ["url_context"]);
-
-		const result = applyPolicy(piBaseline, allMockTools, disabledIn(projectDir), []);
-
-		expect(result.has("url_context")).toBe(false);
-		expect(result.has("web_search")).toBe(true);
-		expect(result.has("custom_tool")).toBe(true);
-		expect(result.has(LOADER_TOOL_NAME)).toBe(true);
+	it("applies on-demand and enables the existing native search tool", () => {
+		const plan = planPolicy(["read", "docs"], tools, { docs: "on-demand" });
+		expect([...plan.active]).toEqual(["read", "tool_search"]);
+		expect(plan.missingSearch).toBe(false);
 	});
-
-	it("never re-adds tools Pi itself turned off (defaultTools / --tools / --exclude-tools)", () => {
-		writeConfigFile(getProjectConfigPath(projectDir), ["web_search"]);
-
-		// 用户在 defaultTools 里砍掉了 bash 和 web_search：Pi 的基线里就没有它们
-		const baseline = ["read", "edit", "write", "url_context", "custom_tool"];
-		const result = applyPolicy(baseline, allMockTools, disabledIn(projectDir), []);
-
-		expect(result.has("bash")).toBe(false);
-		expect(result.has("web_search")).toBe(false);
-		expect(result.has("read")).toBe(true);
+	it("does not unload native search matches on later syncs or reloads", () => {
+		const modes: ToolModes = { docs: "on-demand" };
+		const first = planPolicy(["read", "docs"], tools, modes);
+		const restored = lastPolicyState([{ type: "custom", customType: STATE_ENTRY, data: first.state }]);
+		const next = planPolicy(["read", "tool_search", "docs"], tools, modes, restored);
+		expect(next.active.has("docs")).toBe(true);
+		expect(stateEqual(first.state, next.state)).toBe(true);
 	});
-
-	it("leaves upstream-managed exposures completely alone", () => {
-		// 即便它们出现在 disabledTools 里也不收编：不是我们的池子
-		writeConfigFile(getProjectConfigPath(projectDir), [
-			"mcp__docs__read",
-			"mcp__docs__write",
-			"secret_tool",
-		]);
-
-		const result = applyPolicy(piBaseline, allMockTools, disabledIn(projectDir), []);
-
-		expect(result.has("mcp__docs__read")).toBe(true);
-		expect(result.has("mcp__docs__write")).toBe(true);
-		expect(result.has("secret_tool")).toBe(true);
-		// 上游工具不撑起调度器：没有待命的 direct 扩展工具
-		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
+	it("does not re-add tools another extension deactivated", () => {
+		const first = planPolicy(["read", "bash"], tools, { docs: "always", images: "on-demand" });
+		const next = planPolicy(["read", "tool_search"], tools,
+			{ docs: "always", images: "always" }, first.state);
+		expect(next.active.has("bash")).toBe(false);
+		expect(next.active.has("docs")).toBe(false);
+		expect(next.active.has("images")).toBe(true);
 	});
-
-	it("re-enables a subtracted tool against the frozen baseline, not the already-reduced active set", () => {
-		const frozen = ["read", "bash", "edit", "write", "web_search", "url_context"];
-		writeConfigFile(getProjectConfigPath(projectDir), ["url_context"]);
-
-		const subtracted = applyPolicy(frozen, allMockTools, disabledIn(projectDir), []);
-		expect(subtracted.has("url_context")).toBe(false);
-		// custom_tool 从未进过 Pi 的启动集合，减法结果里也不该出现
-		expect(subtracted.has("custom_tool")).toBe(false);
-
-		writeConfigFile(getProjectConfigPath(projectDir), []);
-		const restored = applyPolicy(frozen, allMockTools, disabledIn(projectDir), []);
-		expect(restored.has("url_context")).toBe(true);
-		expect(restored.has("custom_tool")).toBe(false);
-		expect(restored.has(LOADER_TOOL_NAME)).toBe(false);
+	it("returning to inherit releases control without rewinding the live set", () => {
+		const first = planPolicy(["read"], tools, { docs: "always" });
+		const next = planPolicy(first.active, tools, {}, first.state);
+		expect(next.active.has("docs")).toBe(true);
+		expect(next.state.appliedModes).toEqual({});
 	});
-
-	it("does not let a session delta revive a tool Pi never put in the baseline", () => {
-		const frozen = ["read", "bash", "web_search"];
-		const result = applyPolicy(frozen, allMockTools, new Set(["web_search"]), ["web_search", "custom_tool"]);
-
-		expect(result.has("web_search")).toBe(true);
-		expect(result.has("custom_tool")).toBe(false);
+	it("ignores preferences for builtins, services, hidden and unadapted tools", () => {
+		const modes: ToolModes = { read: "on-demand", bash: "always", tool_search: "on-demand",
+			codemode: "on-demand", legacy: "on-demand", ask: "always", secret: "always" };
+		const plan = planPolicy(["read", "legacy", "codemode"], tools, modes);
+		expect([...plan.active]).toEqual(["read", "legacy", "codemode"]);
+		expect(plan.state.appliedModes).toEqual({});
 	});
-
-	it("keeps subtracted names in the frozen baseline and absorbs only tools Pi activates later", () => {
-		const frozen = absorbBaseline(undefined, ["read", "web_search", "url_context"], undefined);
-		const written = new Set(["read", "web_search", LOADER_TOOL_NAME]);
-		const next = absorbBaseline(frozen, ["read", "web_search", LOADER_TOOL_NAME, "late_direct"], written);
-
-		expect(next.has("url_context")).toBe(true);
-		expect(next.has("late_direct")).toBe(true);
-		expect(next.has(LOADER_TOOL_NAME)).toBe(false);
+	it("never revives a missing or CLI-excluded tool", () => {
+		const plan = planPolicy(["read"], tools.filter((t) => t.name !== "docs"), { docs: "always" });
+		expect([...plan.active]).toEqual(["read"]);
 	});
-
-	it("reload unions the saved baseline with whatever Pi currently has active", () => {
-		const reloaded = absorbBaseline(
-			["read", "web_search", "url_context"],
-			["read", "web_search", "late_direct"],
-			undefined,
-		);
-
-		expect(reloaded.has("url_context")).toBe(true);
-		expect(reloaded.has("late_direct")).toBe(true);
+	it("handles late native registration and conversion without modifying exposure", () => {
+		const first = planPolicy(["legacy"], tools, { legacy: "on-demand" });
+		const converted = tools.map((t) => t.name === "legacy" ? { ...t, exposure: "deferred" as const } : t);
+		const next = planPolicy(first.active, converted, { legacy: "on-demand" }, first.state);
+		expect(next.active.has("legacy")).toBe(false);
+		expect(next.active.has("tool_search")).toBe(true);
+		expect(converted.find((t) => t.name === "legacy")?.exposure).toBe("deferred");
 	});
-
-	it("re-applies the branch session delta on top of the subtraction", () => {
-		writeConfigFile(getProjectConfigPath(projectDir), ["url_context"]);
-
-		const result = applyPolicy(piBaseline, allMockTools, disabledIn(projectDir), ["url_context"]);
-
-		expect(result.has("url_context")).toBe(true);
-		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
+	it("does not reapply on-demand when a known MCP tool is temporarily absent on resume", () => {
+		const modes: ToolModes = { docs: "on-demand" };
+		const first = planPolicy(["read"], tools, modes);
+		const disconnected = planPolicy(["read"], tools.filter((t) => t.name !== "docs"), modes, first.state);
+		const reconnected = planPolicy(["read", "docs"], tools, modes, disconnected.state);
+		expect(reconnected.active.has("docs")).toBe(true);
 	});
-
-	it("respects the user disabling enable_tool itself", () => {
-		writeConfigFile(getProjectConfigPath(projectDir), ["url_context", LOADER_TOOL_NAME]);
-
-		const result = applyPolicy(piBaseline, allMockTools, disabledIn(projectDir), []);
-
-		expect(result.has("url_context")).toBe(false);
-		expect(result.has(LOADER_TOOL_NAME)).toBe(false);
+	it("applies a changed preference when a disconnected tool reappears", () => {
+		const first = planPolicy([], tools, { docs: "on-demand" });
+		const absent = planPolicy([], [], { docs: "always" }, first.state);
+		const next = planPolicy([], tools, { docs: "always" }, absent.state);
+		expect(next.active.has("docs")).toBe(true);
 	});
-
-	it("getInactiveTools pool contains ONLY activatable extensions, never builtins, loader or upstream tools", () => {
-		const activeNames = ["read", "bash", "edit", "write", LOADER_TOOL_NAME, "web_search"];
-		const inactive = getInactiveTools(allMockTools, activeNames);
-
-		// 上游 exposure（deferred / codemode / hidden）不归本扩展待命池
-		expect(inactive.map((t) => t.name).sort()).toEqual(["custom_tool", "url_context"]);
+	it("warns when discovery is absent, and enables it when it arrives", () => {
+		const modes: ToolModes = { docs: "on-demand" };
+		const first = planPolicy(["docs"], tools.filter((t) => t.name !== "tool_search"), modes);
+		expect(first.missingSearch).toBe(true);
+		expect(first.active.has("tool_search")).toBe(false);
+		const next = planPolicy(first.active, tools, modes, first.state);
+		expect(next.active.has("tool_search")).toBe(true);
 	});
-
-	it("getInactiveTools ignores on-demand tools Pi never included", () => {
-		const inactive = getInactiveTools(allMockTools, ["read", "web_search"], ["read", "web_search", "url_context"]);
-		expect(inactive.map((tool) => tool.name)).toEqual(["url_context"]);
+	it("takes policy from the active branch, not old tools-config snapshots", () => {
+		const state = planPolicy([], tools, { docs: "always" }).state;
+		expect(lastPolicyState([{ type: "custom", customType: "tools-config", data: { enabledTools: ["docs"] } }])).toBeUndefined();
+		expect(lastPolicyState([
+			{ type: "custom", customType: STATE_ENTRY, data: state },
+			{ type: "custom", customType: STATE_ENTRY, data: { appliedModes: { docs: "invalid" } } },
+		])).toEqual(state);
+	});
+	it("treats tool names as data, including object prototype keys", () => {
+		const special = [tool("__proto__"), tool("constructor")];
+		const modes = JSON.parse('{"__proto__":"always","constructor":"on-demand"}');
+		const plan = planPolicy(["constructor"], special, modes);
+		expect(plan.active.has("__proto__")).toBe(true);
+		expect(plan.active.has("constructor")).toBe(false);
+		expect(modeOf({}, "constructor")).toBe("inherit");
+	});
+	it("compares names without order or duplicate sensitivity", () => {
+		expect(sameNames(["docs", "read", "read"], ["read", "docs"])).toBe(true);
+		expect(sameNames(["read"], [])).toBe(false);
 	});
 });

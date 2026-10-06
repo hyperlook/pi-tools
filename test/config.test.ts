@@ -1,270 +1,98 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-	deleteProjectConfigFile,
-	formatDisplayPath,
-	getGlobalConfigPath,
-	getProjectConfigPath,
-	hasProjectConfig,
-	persistToolPreference,
-	readConfigFile,
-	readScopeConfig,
-	configFingerprint,
-	resolveEffectiveConfig,
-	saveScopeConfig,
-	writeConfigFile,
-} from "../src/config.ts";
-import { LOADER_TOOL_NAME } from "../src/shared.ts";
+import { configFingerprint, deleteProjectConfigFile, getGlobalConfigPath, getProjectConfigPath,
+	readConfigFile, readScopeConfig, resolveEffectiveConfig, saveScopeConfig, writeConfigFile } from "../src/config.ts";
 
-describe("config tests", () => {
-	let testDir: string;
-	let projectDir: string;
-	let globalDir: string;
-	let origAgentDir: string | undefined;
-	let origToolsConfig: string | undefined;
-
+describe("native preference config", () => {
+	let dir: string, cwd: string, global: string;
+	let originalAgent: string | undefined, originalOverride: string | undefined;
 	beforeEach(() => {
-		testDir = join(tmpdir(), `pi-tools-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		projectDir = join(testDir, "project");
-		globalDir = join(testDir, "agent");
-		mkdirSync(projectDir, { recursive: true });
-		mkdirSync(globalDir, { recursive: true });
-
-		origAgentDir = process.env.PI_CODING_AGENT_DIR;
-		origToolsConfig = process.env.PI_TOOLS_CONFIG;
-
-		process.env.PI_CODING_AGENT_DIR = globalDir;
+		dir = mkdtempSync(join(tmpdir(), "pi-tools-config-"));
+		cwd = join(dir, "project");
+		mkdirSync(cwd);
+		originalAgent = process.env.PI_CODING_AGENT_DIR;
+		originalOverride = process.env.PI_TOOLS_CONFIG;
+		process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
 		delete process.env.PI_TOOLS_CONFIG;
+		global = getGlobalConfigPath();
 	});
-
 	afterEach(() => {
-		if (origAgentDir !== undefined) {
-			process.env.PI_CODING_AGENT_DIR = origAgentDir;
-		} else {
-			delete process.env.PI_CODING_AGENT_DIR;
-		}
-
-		if (origToolsConfig !== undefined) {
-			process.env.PI_TOOLS_CONFIG = origToolsConfig;
-		} else {
-			delete process.env.PI_TOOLS_CONFIG;
-		}
-
-		rmSync(testDir, { recursive: true, force: true });
+		if (originalAgent === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = originalAgent;
+		if (originalOverride === undefined) delete process.env.PI_TOOLS_CONFIG;
+		else process.env.PI_TOOLS_CONFIG = originalOverride;
+		rmSync(dir, { recursive: true, force: true });
 	});
-
-	it("resolves global config when no project config exists", () => {
-		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, ["web_search", "mcp"]);
-
-		const res = resolveEffectiveConfig(projectDir, true);
-		expect(res.scope).toBe("global");
-		expect(res.disabledTools).toEqual(["web_search", "mcp"]);
-		expect(res.hasProjectConfig).toBe(false);
+	it("defaults to following extensions without config", () => {
+		expect(resolveEffectiveConfig(cwd, true).toolModes).toEqual({});
+		expect(resolveEffectiveConfig(cwd, true).scope).toBe("global");
 	});
-
-	it("overrides global config when trusted project config exists", () => {
-		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, ["web_search", "mcp"]);
-
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, ["custom_tool"]);
-
-		const res = resolveEffectiveConfig(projectDir, true);
-		expect(res.scope).toBe("project");
-		expect(res.disabledTools).toEqual(["custom_tool"]);
-		expect(res.hasProjectConfig).toBe(true);
+	it("reads global preferences", () => {
+		writeConfigFile(global, { docs: "on-demand" });
+		expect(resolveEffectiveConfig(cwd, true).toolModes).toEqual({ docs: "on-demand" });
 	});
-
-	it("changes fingerprint when the effective disabledTools change", () => {
-		const before = configFingerprint(projectDir, true);
-		writeConfigFile(getProjectConfigPath(projectDir), ["image_gen"]);
-		const after = configFingerprint(projectDir, true);
-		expect(after).not.toBe(before);
-		expect(configFingerprint(projectDir, true)).toBe(after);
+	it("trusted project replaces the global map, including with an empty map", () => {
+		writeConfigFile(global, { docs: "always" });
+		writeConfigFile(getProjectConfigPath(cwd), {});
+		expect(resolveEffectiveConfig(cwd, true).scope).toBe("project");
+		expect(resolveEffectiveConfig(cwd, true).toolModes).toEqual({});
 	});
-
-	it("produces identical fingerprint regardless of disabledTools array order", () => {
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, ["web_search", "image_gen", "bash"]);
-		const fp1 = configFingerprint(projectDir, true);
-
-		writeConfigFile(projPath, ["bash", "image_gen", "web_search"]);
-		const fp2 = configFingerprint(projectDir, true);
-
-		expect(fp1).toBe(fp2);
+	it("does not read untrusted project preferences", () => {
+		writeConfigFile(global, { docs: "always" });
+		writeConfigFile(getProjectConfigPath(cwd), { docs: "on-demand" });
+		expect(resolveEffectiveConfig(cwd, false).toolModes).toEqual({ docs: "always" });
 	});
-
-	it("ignores project config when project is not trusted", () => {
-		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, ["web_search"]);
-
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, ["malicious_tool"]);
-
-		const res = resolveEffectiveConfig(projectDir, false);
-		expect(res.scope).toBe("global");
-		expect(res.disabledTools).toEqual(["web_search"]);
+	it("uses the environment path exclusively for reads and writes", () => {
+		process.env.PI_TOOLS_CONFIG = join(dir, "override.json");
+		writeConfigFile(global, { docs: "always" });
+		saveScopeConfig({ scope: "project", cwd, modes: { docs: "on-demand" } });
+		expect(resolveEffectiveConfig(cwd, true).isEnvOverridden).toBe(true);
+		expect(readScopeConfig("global", cwd)).toEqual({ docs: "on-demand" });
+		expect(readConfigFile(global)).toEqual({ docs: "always" });
+		expect(existsSync(getProjectConfigPath(cwd))).toBe(false);
 	});
-
-	it("prioritizes PI_TOOLS_CONFIG env var over project and global", () => {
-		const envConfigFile = join(testDir, "custom-env.json");
-		writeConfigFile(envConfigFile, ["env_tool"]);
-		process.env.PI_TOOLS_CONFIG = envConfigFile;
-
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, ["proj_tool"]);
-
-		const res = resolveEffectiveConfig(projectDir, true);
-		expect(res.scope).toBe("global");
-		expect(res.path).toBe(envConfigFile);
-		expect(res.disabledTools).toEqual(["env_tool"]);
-		expect(res.isEnvOverridden).toBe(true);
+	it("falls back to global for malformed project config", () => {
+		writeConfigFile(global, { docs: "always" });
+		writeConfigFile(getProjectConfigPath(cwd), {});
+		writeFileSync(getProjectConfigPath(cwd), '{"toolModes":{"docs":"disabled"}}');
+		expect(resolveEffectiveConfig(cwd, true).scope).toBe("global");
+		writeFileSync(getProjectConfigPath(cwd), '{broken');
+		expect(readScopeConfig("project", cwd)).toBeUndefined();
 	});
-
-	it("adds tool to disabledTools when disabled via persistToolPreference", () => {
-		const known = new Set([LOADER_TOOL_NAME, "web_search"]);
-
-		// Disabling web_search when no prior config existed
-		persistToolPreference({
-			toolName: "web_search",
-			enabled: false,
-			targetScope: "project",
-			cwd: projectDir,
-			knownTools: known,
-		});
-
-		const projPath = getProjectConfigPath(projectDir);
-		expect(existsSync(projPath)).toBe(true);
-		// Must record web_search in disabledTools
-		expect(readConfigFile(projPath)).toEqual(["web_search"]);
-
-		// Re-enabling web_search removes it from disabledTools
-		persistToolPreference({
-			toolName: "web_search",
-			enabled: true,
-			targetScope: "project",
-			cwd: projectDir,
-			knownTools: known,
-		});
-		expect(readConfigFile(projPath)).toEqual([]);
+	it("does not migrate legacy disabledTools files", () => {
+		writeConfigFile(global, {});
+		writeFileSync(global, '{"disabledTools":["docs","enable_tool"]}');
+		expect(readConfigFile(global)).toBeUndefined();
+		expect(resolveEffectiveConfig(cwd, true).toolModes).toEqual({});
 	});
-
-	it("allows project to explicitly have empty disabledTools array", () => {
-		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, ["web_search", "mcp"]);
-
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, []);
-
-		const res = resolveEffectiveConfig(projectDir, true);
-		expect(res.scope).toBe("project");
-		expect(res.disabledTools).toEqual([]);
-		expect(res.hasProjectConfig).toBe(true);
+	it("normalizes explicit inherit entries and ignores map ordering in fingerprints", () => {
+		writeConfigFile(global, {});
+		writeFileSync(global, '{"toolModes":{"z":"always","a":"on-demand","docs":"inherit"}}');
+		const first = configFingerprint(cwd, true);
+		expect(readConfigFile(global)).toEqual({ z: "always", a: "on-demand" });
+		writeConfigFile(global, { a: "on-demand", z: "always" });
+		expect(configFingerprint(cwd, true)).toBe(first);
+		writeConfigFile(global, { a: "always", z: "always" });
+		expect(configFingerprint(cwd, true)).not.toBe(first);
 	});
-
-	it("gracefully falls back to global if project config is invalid json", () => {
-		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, ["web_search"]);
-
-		const projPath = getProjectConfigPath(projectDir);
-		mkdirSync(join(projectDir, ".pi"), { recursive: true });
-		writeFileSync(projPath, "invalid-json-content{");
-
-		const res = resolveEffectiveConfig(projectDir, true);
-		expect(res.scope).toBe("global");
-		expect(res.disabledTools).toEqual(["web_search"]);
+	it("preserves preferences for temporarily unavailable tools", () => {
+		saveScopeConfig({ scope: "global", cwd, modes: { disconnected_mcp: "on-demand", docs: "always" } });
+		expect(readConfigFile(global)).toEqual({ disconnected_mcp: "on-demand", docs: "always" });
 	});
-
-	it("modifies existing project config without touching global", () => {
-		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, ["web_search"]);
-
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, ["custom_tool_1"]);
-
-		const known = new Set(["custom_tool_1", "custom_tool_2"]);
-
-		// Disable custom_tool_2 on project
-		persistToolPreference({
-			toolName: "custom_tool_2",
-			enabled: false,
-			targetScope: "project",
-			cwd: projectDir,
-			knownTools: known,
-		});
-
-		expect(readConfigFile(projPath)).toEqual(["custom_tool_1", "custom_tool_2"]);
-		expect(readConfigFile(globalPath)).toEqual(["web_search"]);
+	it("resetting project restores global inheritance", () => {
+		writeConfigFile(global, { docs: "always" });
+		writeConfigFile(getProjectConfigPath(cwd), { docs: "on-demand" });
+		expect(deleteProjectConfigFile(cwd)).toBe(true);
+		expect(deleteProjectConfigFile(cwd)).toBe(false);
+		expect(resolveEffectiveConfig(cwd, true).toolModes).toEqual({ docs: "always" });
 	});
-
-	it("refuses to persist builtin tools that are not in knownTools", () => {
-		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, [LOADER_TOOL_NAME]);
-
-		const known = new Set([LOADER_TOOL_NAME, "web_search"]);
-
-		persistToolPreference({
-			toolName: "bash",
-			enabled: false,
-			targetScope: "global",
-			cwd: projectDir,
-			knownTools: known,
-		});
-
-		expect(readConfigFile(globalPath)).toEqual([LOADER_TOOL_NAME]);
-	});
-
-	it("allows disabling enable_tool in disabledTools", () => {
-		const globalPath = join(globalDir, "pi-tools.json");
-		writeConfigFile(globalPath, ["web_search"]);
-
-		const known = new Set([LOADER_TOOL_NAME, "web_search"]);
-
-		persistToolPreference({
-			toolName: LOADER_TOOL_NAME,
-			enabled: false,
-			targetScope: "global",
-			cwd: projectDir,
-			knownTools: known,
-		});
-
-		expect(readConfigFile(globalPath)?.sort()).toEqual(["enable_tool", "web_search"]);
-	});
-
-	it("reads scope config accurately using readScopeConfig", () => {
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, ["project_tool"]);
-
-		expect(readScopeConfig("project", projectDir)).toEqual(["project_tool"]);
-		expect(readScopeConfig("global", projectDir)).toBeUndefined();
-	});
-
-	it("deletes project config file when requested and returns status", () => {
-		const projPath = getProjectConfigPath(projectDir);
-		writeConfigFile(projPath, ["custom_tool"]);
-		expect(existsSync(projPath)).toBe(true);
-
-		const deleted = deleteProjectConfigFile(projectDir);
-		expect(deleted).toBe(true);
-		expect(existsSync(projPath)).toBe(false);
-
-		// Deleting again returns false
-		expect(deleteProjectConfigFile(projectDir)).toBe(false);
-	});
-
-	it("saves scope config with knownTools filtering applied", () => {
-		const known = new Set(["tool_a", "tool_b"]);
-		saveScopeConfig({
-			scope: "project",
-			cwd: projectDir,
-			disabledNames: ["tool_a", "unknown_tool", "tool_b"],
-			knownTools: known,
-		});
-
-		const projPath = getProjectConfigPath(projectDir);
-		expect(readConfigFile(projPath)).toEqual(["tool_a", "tool_b"]);
+	it("validates maps and supports arbitrary tool names safely", () => {
+		writeConfigFile(global, JSON.parse('{"__proto__":"on-demand"}'));
+		expect(Object.hasOwn(readConfigFile(global)!, "__proto__")).toBe(true);
+		writeFileSync(global, '{"toolModes":[]}');
+		expect(readConfigFile(global)).toBeUndefined();
+		expect(() => writeConfigFile(global, { docs: "invalid" } as any)).toThrow();
 	});
 });

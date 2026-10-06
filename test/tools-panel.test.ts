@@ -1,300 +1,122 @@
 import { describe, expect, it } from "bun:test";
-import type { ToolExposure, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { createToolsPanel, type ToolsPanelSaveResult } from "../src/tools-panel.ts";
-
-function mockTool(name: string, isBuiltin: boolean, exposure: ToolExposure = "direct"): ToolInfo {
-	return {
-		name,
-		description: `Description of ${name}`,
-		parameters: { type: "object", properties: {} },
-		exposure,
-		sourceInfo: isBuiltin ? { source: "builtin" } : { source: "npm:test" },
-	} as ToolInfo;
+import type { KeybindingsManager, Theme, ToolInfo } from "@earendil-works/pi-coding-agent";
+import type { TUI } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import { createToolsPanel, sortTools, type ToolsPanelOptions, type ToolsPanelSaveResult } from "../src/tools-panel.ts";
+const theme = { fg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
+const kb = { matches: () => false } as unknown as KeybindingsManager;
+const tui = { requestRender() {} } as TUI;
+function tool(name: string, exposure: ToolInfo["exposure"] = "deferred", source = "npm:example"): ToolInfo {
+	return { name, exposure, description: `Description of ${name}`, parameters: { type: "object" }, sourceInfo: { source } };
 }
-
-const mockTheme = {
-	fg: (_color: string, text: string) => text,
-	bold: (text: string) => text,
-} as any;
-
-const mockTui = {
-	requestRender: () => {},
-} as any;
-
-const mockKb = {
-	matches: (data: string, action: string) => {
-		if (action === "tui.select.confirm" && data === "\r") return true;
-		if (action === "tui.select.down" && data === "j") return true;
-		if (action === "tui.select.cancel" && data === "q") return true;
-		return false;
-	},
-} as any;
-
-describe("tools panel interactions (Draft & Commit model)", () => {
-	const tools: ToolInfo[] = [
-		mockTool("read", true),
-		mockTool("bash", true),
-		mockTool("mcp__docs__read", false, "deferred"),
-		mockTool("web_search", false),
-		mockTool("url_context", false),
-	];
-
-	it("renders active vs inactive state for builtin tools with locked indicator", () => {
-		const activeNames = new Set(["read"]);
-		const initialGlobalEnabled = new Set(["web_search"]);
-
-		const panel = createToolsPanel({
-			tui: mockTui,
-			theme: mockTheme,
-			kb: mockKb,
-			done: () => {},
-			tools,
-			activeNames,
-			initialScope: "project",
-			canUseProjectScope: true,
-			projectDisplayPath: ".pi/pi-tools.json",
-			globalDisplayPath: "~/.pi/agent/pi-tools.json",
-			initialGlobalEnabled,
-			initialProjectEnabled: undefined, // 继承全局
-			onSave: () => {},
-		});
-
-		const lines = panel.render(100);
-		const fullText = lines.join("\n");
-
-		expect(fullText).toContain("read");
-		expect(fullText).toContain("active ⊘");
-
-		expect(fullText).toContain("bash");
-		expect(fullText).toContain("inactive ⊘");
-
-		// web_search 继承自全局，应显示 enabled 且带 ⇡ 标识
-		expect(fullText).toContain("web_search");
-		expect(fullText).toContain("enabled ⇡");
-		expect(fullText).toContain("继承全局");
+function setup(overrides: Partial<ToolsPanelOptions> = {}) {
+	let saved: ToolsPanelSaveResult | undefined, closed = false;
+	const panel = createToolsPanel({
+		tui, theme, kb, done: () => { closed = true; }, tools: [tool("docs")], activeNames: new Set(),
+		initialScope: "global", canUseProjectScope: true, projectDisplayPath: ".pi/pi-tools.json",
+		globalDisplayPath: "~/.pi/agent/pi-tools.json", initialGlobalModes: {}, initialProjectModes: undefined,
+		onSave: (result) => { saved = result; }, ...overrides,
 	});
-
-	it("locks upstream-managed exposures and explains who owns them", () => {
-		const panel = createToolsPanel({
-			tui: mockTui,
-			theme: mockTheme,
-			kb: mockKb,
-			done: () => {},
-			tools,
-			activeNames: new Set(["read", "mcp__docs__read"]),
-			initialScope: "global",
-			canUseProjectScope: true,
-			projectDisplayPath: ".pi/pi-tools.json",
-			globalDisplayPath: "~/.pi/agent/pi-tools.json",
-			initialGlobalEnabled: new Set(["web_search", "url_context"]),
-			initialProjectEnabled: undefined,
-			onSave: () => {},
-		});
-
-		expect(panel.render(100).join("\n")).toContain("[upstream]");
-
-		// 光标移到 deferred 工具（index 2），空格应被拒绝并说明上游归属
-		panel.handleInput("j");
-		panel.handleInput("j");
-		panel.handleInput(" ");
-		expect(panel.render(100).join("\n")).toContain("exposure=deferred，由 tool_search / codemode 托管");
+	return { panel, saved: () => saved, closed: () => closed, text: () => panel.render(120).join("\n") };
+}
+describe("three-state native preference panel", () => {
+	it("cycles follow, always, on-demand, follow and removes the override", () => {
+		const test = setup();
+		expect(test.text()).toContain("跟随扩展");
+		test.panel.handleInput(" ");
+		expect(test.text()).toContain("常驻");
+		expect(test.text()).toContain("未保存 *");
+		test.panel.handleInput(" ");
+		expect(test.text()).toContain("按需");
+		test.panel.handleInput(" ");
+		expect(test.text()).not.toContain("未保存 *");
+		test.panel.handleInput("\r");
+		expect(test.saved()?.globalModes).toEqual({});
 	});
-
-	it("locks tools Pi left out of its baseline and refuses to pull them back", () => {
-		const panel = createToolsPanel({
-			tui: mockTui,
-			theme: mockTheme,
-			kb: mockKb,
-			done: () => {},
-			tools,
-			activeNames: new Set(["read", "bash"]),
-			baselineNames: new Set(["read", "bash", "url_context"]),
-			initialScope: "global",
-			canUseProjectScope: true,
-			projectDisplayPath: ".pi/pi-tools.json",
-			globalDisplayPath: "~/.pi/agent/pi-tools.json",
-			initialGlobalEnabled: new Set(["web_search", "url_context"]),
-			initialProjectEnabled: undefined,
-			onSave: () => {},
-		});
-
-		// read, bash, deferred, web_search：光标移到不在基线里的 web_search
-		panel.handleInput("j");
-		panel.handleInput("j");
-		panel.handleInput("j");
-		expect(panel.render(100).join("\n")).toContain("Pi 未纳入启动集合");
-
-		panel.handleInput(" ");
-		expect(panel.render(100).join("\n")).toContain("web_search 不在 Pi 的启动集合里，本面板不能拉回");
+	it("keeps draft edits off disk until save", () => {
+		const test = setup();
+		test.panel.handleInput(" ");
+		expect(test.saved()).toBeUndefined();
+		test.panel.handleInput("\r");
+		expect(test.saved()?.globalModes).toEqual({ docs: "always" });
+		expect(test.closed()).toBe(true);
 	});
-
-	it("refuses to toggle builtin tool and shows friendly warning notice", () => {
-		const activeNames = new Set(["read", "bash"]);
-		let saved: ToolsPanelSaveResult | undefined;
-
-		const panel = createToolsPanel({
-			tui: mockTui,
-			theme: mockTheme,
-			kb: mockKb,
-			done: () => {},
-			tools,
-			activeNames,
-			initialScope: "project",
-			canUseProjectScope: true,
-			projectDisplayPath: ".pi/pi-tools.json",
-			globalDisplayPath: "~/.pi/agent/pi-tools.json",
-			initialGlobalEnabled: new Set(),
-			initialProjectEnabled: undefined,
-			onSave: (res) => {
-				saved = res;
-			},
-		});
-
-		// Cursor is at index 0 ("read", builtin tool)
-		panel.handleInput(" ");
-
-		// No save triggered, warning rendered
-		expect(saved).toBeUndefined();
-		const lines = panel.render(100);
-		const fullText = lines.join("\n");
-		expect(fullText).toContain("内置核心工具 read 由 defaultTools 托管，请在 settings.json 中调整");
+	it("cancels drafts with q or Escape", () => {
+		for (const key of ["q", "\x1b"]) {
+			const test = setup();
+			test.panel.handleInput(" ");
+			test.panel.handleInput(key);
+			expect(test.saved()).toBeUndefined();
+			expect(test.closed()).toBe(true);
+		}
 	});
-
-	it("forks project config from global baseline on edit and saves on Enter", () => {
-		let saved: ToolsPanelSaveResult | undefined;
-		let closed = false;
-
-		// 全局开启了 web_search 和 url_context
-		const initialGlobal = new Set(["web_search", "url_context"]);
-
-		const panel = createToolsPanel({
-			tui: mockTui,
-			theme: mockTheme,
-			kb: mockKb,
-			done: () => {
-				closed = true;
-			},
-			tools,
-			activeNames: new Set(["read"]),
-			initialScope: "project",
-			canUseProjectScope: true,
-			projectDisplayPath: ".pi/pi-tools.json",
-			globalDisplayPath: "~/.pi/agent/pi-tools.json",
-			initialGlobalEnabled: initialGlobal,
-			initialProjectEnabled: undefined, // 初始继承全局
-			onSave: (res) => {
-				saved = res;
-			},
-		});
-
-		// 光标移到 web_search (index 3)
-		panel.handleInput("j");
-		panel.handleInput("j");
-		panel.handleInput("j");
-
-		// 按空格关闭 web_search
-		panel.handleInput(" ");
-
-		// 此时尚未落盘，未调用 onSave
-		expect(saved).toBeUndefined();
-		expect(closed).toBe(false);
-
-		// 查看渲染：已经派生，不再显示 (继承)，且 web_search 变为 disabled
-		const textBeforeSave = panel.render(100).join("\n");
-		expect(textBeforeSave).toContain("已定制");
-		expect(textBeforeSave).toContain("未保存 *");
-
-		// 按回车确认保存
-		panel.handleInput("\r");
-
-		expect(closed).toBe(true);
-		expect(saved).toBeDefined();
-		// 项目独立配置应该被派生生成：包含了保留的 url_context，排除了关掉的 web_search
-		expect(Array.from(saved!.projectEnabled ?? [])).toEqual(["url_context"]);
-		// 全局配置原封不动
-		expect(Array.from(saved!.globalEnabled).sort()).toEqual(["url_context", "web_search"]);
+	it("forks project preferences from global on first edit", () => {
+		const test = setup({ initialScope: "project", initialGlobalModes: { docs: "always", absent: "on-demand" } });
+		expect(test.text()).toContain("继承全局");
+		test.panel.handleInput(" ");
+		expect(test.text()).toContain("已定制");
+		test.panel.handleInput("\r");
+		expect(test.saved()).toEqual({ globalModes: { docs: "always", absent: "on-demand" },
+			projectModes: { docs: "on-demand", absent: "on-demand" } });
 	});
-
-	it("discards draft edits and does not call onSave when canceled with Esc/q", () => {
-		let saved: ToolsPanelSaveResult | undefined;
-		let closed = false;
-
-		const panel = createToolsPanel({
-			tui: mockTui,
-			theme: mockTheme,
-			kb: mockKb,
-			done: () => {
-				closed = true;
-			},
-			tools,
-			activeNames: new Set(["read"]),
-			initialScope: "global",
-			canUseProjectScope: true,
-			projectDisplayPath: ".pi/pi-tools.json",
-			globalDisplayPath: "~/.pi/agent/pi-tools.json",
-			initialGlobalEnabled: new Set(["web_search"]),
-			initialProjectEnabled: undefined,
-			onSave: (res) => {
-				saved = res;
-			},
-		});
-
-		// 光标移到 web_search (index 3)
-		panel.handleInput("j");
-		panel.handleInput("j");
-		panel.handleInput("j");
-
-		// 按空格关闭 web_search
-		panel.handleInput(" ");
-
-		// 按 q / Esc 取消退出
-		panel.handleInput("q");
-
-		expect(closed).toBe(true);
-		expect(saved).toBeUndefined();
+	it("resets project preferences to global inheritance", () => {
+		const test = setup({ initialScope: "project", initialProjectModes: { docs: "always" } });
+		test.panel.handleInput("r");
+		expect(test.text()).toContain("继承全局");
+		test.panel.handleInput("\r");
+		expect(test.saved()?.projectModes).toBeUndefined();
 	});
-
-	it("allows resetting project config to inherit global using r key", () => {
-		let saved: ToolsPanelSaveResult | undefined;
-		let closed = false;
-
-		const panel = createToolsPanel({
-			tui: mockTui,
-			theme: mockTheme,
-			kb: mockKb,
-			done: () => {
-				closed = true;
-			},
-			tools,
-			activeNames: new Set(["read"]),
-			initialScope: "project",
-			canUseProjectScope: true,
-			projectDisplayPath: ".pi/pi-tools.json",
-			globalDisplayPath: "~/.pi/agent/pi-tools.json",
-			initialGlobalEnabled: new Set(["web_search"]),
-			initialProjectEnabled: new Set(["url_context"]), // 已有独立定制
-			onSave: (res) => {
-				saved = res;
-			},
-		});
-
-		// 处于定制态
-		expect(panel.render(100).join("\n")).toContain("已定制");
-
-		// 按 r 恢复继承全局
-		panel.handleInput("r");
-
-		// 检查渲染状态变为继承全局
-		const textAfterReset = panel.render(100).join("\n");
-		expect(textAfterReset).toContain("继承全局");
-		expect(textAfterReset).toContain("已重置项目配置，恢复继承全局");
-
-		// 回车保存
-		panel.handleInput("\r");
-
-		expect(closed).toBe(true);
-		expect(saved).toBeDefined();
-		// projectEnabled 应该为 undefined，表示恢复继承全局（将删除 .pi/pi-tools.json）
-		expect(saved!.projectEnabled).toBeUndefined();
+	it("lets deferred and codemode tools be edited, but not direct or model-only tools", () => {
+		for (const exposure of ["deferred", "codemode", "direct", "model-only", "hidden"] as const) {
+			const test = setup({ tools: [tool("docs", exposure)] });
+			test.panel.handleInput(" ");
+			test.panel.handleInput("\r");
+			expect(test.saved()?.globalModes).toEqual(
+				exposure === "deferred" || exposure === "codemode" ? { docs: "always" } : {});
+		}
+	});
+	it("shows why unadapted tools are readonly", () => {
+		const test = setup({ tools: [tool("old", "direct")] });
+		test.panel.handleInput(" ");
+		expect(test.text()).toContain("需由工具所属扩展适配 deferred");
+		expect(test.text()).toContain("只读");
+	});
+	it("does not edit builtins or native orchestrators", () => {
+		for (const entry of [tool("read", "direct", "builtin"), tool("tool_search", "model-only"), tool("codemode", "model-only")]) {
+			const test = setup({ tools: [entry] });
+			test.panel.handleInput(" ");
+			test.panel.handleInput("\r");
+			expect(test.saved()?.globalModes).toEqual({});
+		}
+	});
+	it("locks project scope for untrusted projects or an env override", () => {
+		for (const opts of [{ canUseProjectScope: false }, { isEnvOverridden: true }]) {
+			const test = setup(opts);
+			test.panel.handleInput("\t");
+			expect(test.text()).toContain("Global");
+		}
+	});
+	it("separates configured preference from current declaration state", () => {
+		const test = setup({ initialGlobalModes: { docs: "on-demand" }, activeNames: new Set(["docs"]) });
+		expect(test.text()).toContain("按需 · 已声明");
+	});
+	it("keeps every line within narrow widths, including Chinese and ANSI", () => {
+		const ansiTheme = { fg: (_: string, text: string) => `\x1b[36m${text}\x1b[0m`,
+			bold: (text: string) => `\x1b[1m${text}\x1b[0m` } as Theme;
+		const test = setup({ tools: [tool("很长的中文工具名称".repeat(4))], theme: ansiTheme });
+		for (const width of [0, 1, 8, 24, 80]) {
+			for (const line of test.panel.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+	});
+	it("handles an empty list and preserves unavailable-tool preferences", () => {
+		const test = setup({ tools: [], initialGlobalModes: { offline: "on-demand" } });
+		for (const key of ["j", "k", " "]) test.panel.handleInput(key);
+		expect(test.text()).toContain("没有已注册的工具");
+		test.panel.handleInput("\r");
+		expect(test.saved()?.globalModes).toEqual({ offline: "on-demand" });
+	});
+	it("sorts builtins, services, native tools then unsupported tools", () => {
+		const sorted = sortTools([tool("old", "direct"), tool("docs"), tool("tool_search", "model-only"), tool("read", "direct", "builtin")]);
+		expect(sorted.map((t) => t.name)).toEqual(["read", "tool_search", "docs", "old"]);
 	});
 });

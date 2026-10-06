@@ -1,7 +1,7 @@
 {
   "name": "pi-tools",
-  "version": "1.1.0",
-  "description": "Pi 按需启用工具：开场扫描扩展工具写入 enable_tool 目录，人用 /tools 记非内置默认，模型用 enable_tool 只改当前会话",
+  "version": "2.0.0",
+  "description": "Pi 原生工具加载偏好面板：跟随扩展、常驻或按需，使用系统 tool_search",
   "type": "module",
   "main": "src/index.ts",
   "keywords": [
@@ -39,7 +39,6 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=1.0.0",
-    "@earendil-works/pi-tui": ">=1.0.0",
-    "typebox": "*"
+    "@earendil-works/pi-tui": ">=1.0.0"
   }
 }
