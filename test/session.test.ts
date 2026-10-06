@@ -1,115 +1,106 @@
 import { describe, expect, it } from "bun:test";
-import type { ToolExposure, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { lastPolicyState, planPolicy, sameNames, STATE_ENTRY, stateEqual } from "../src/policy.ts";
-import { modeOf, nextMode, type ToolModes } from "../src/shared.ts";
-
-function tool(name: string, exposure: ToolExposure = "deferred", source = "npm:example"): ToolInfo {
+import type { ToolInfo } from "@earendil-works/pi-coding-agent";
+import { exposuresEqual, lastPolicyState, planPolicy, sameNames, STATE_ENTRY } from "../src/policy.ts";
+import { configuredExposure, nextExposure } from "../src/shared.ts";
+function tool(name: string, exposure: ToolInfo["exposure"] = "direct", source = "example"): ToolInfo {
 	return { name, exposure, description: name, parameters: { type: "object" }, sourceInfo: { source } };
 }
-const tools = [tool("read", "direct", "builtin"), tool("bash", "direct", "builtin"),
-	tool("tool_search", "model-only"), tool("codemode", "model-only"), tool("docs"),
-	tool("images", "codemode"), tool("legacy", "direct"), tool("ask", "model-only"), tool("secret", "hidden")];
-
-describe("native loading policy", () => {
-	it("does not touch the startup loadout without explicit preferences", () => {
-		const active = ["read", "legacy", "docs"];
-		expect([...planPolicy(active, tools, {}).active]).toEqual(active);
+const search = tool("tool_search", "model-only");
+const codemode = tool("codemode", "model-only");
+describe("exposure transition policy", () => {
+	it("leaves the live loadout untouched without overrides", () => {
+		const result = planPolicy(["bash", "legacy"], [tool("legacy"), tool("docs", "deferred"), search], {});
+		expect([...result.active]).toEqual(["bash", "legacy"]);
+		expect(result.applied).toEqual({});
 	});
-	it("cycles three modes with an explicit opt-out", () => {
-		expect(nextMode("inherit")).toBe("always");
-		expect(nextMode("always")).toBe("on-demand");
-		expect(nextMode("on-demand")).toBe("inherit");
-		expect(modeOf({}, "docs")).toBe("inherit");
+	it("cycles only real exposure values", () => {
+		expect(nextExposure("direct")).toBe("codemode");
+		expect(nextExposure("codemode")).toBe("deferred");
+		expect(nextExposure("deferred")).toBe("direct");
+		expect(configuredExposure({}, "legacy", "direct")).toBe("direct");
 	});
-	it("activates a native tool when switching to always", () => {
-		const plan = planPolicy(["read"], tools, { docs: "always" });
-		expect([...plan.active]).toEqual(["read", "docs"]);
+	it("activates direct overrides exactly once", () => {
+		const tools = [tool("docs")];
+		const first = planPolicy([], tools, { docs: "direct" });
+		expect(first.active.has("docs")).toBe(true);
+		const later = planPolicy([], tools, { docs: "direct" }, first.applied);
+		expect(later.active.has("docs")).toBe(false);
 	});
-	it("applies on-demand and enables the existing native search tool", () => {
-		const plan = planPolicy(["read", "docs"], tools, { docs: "on-demand" });
-		expect([...plan.active]).toEqual(["read", "tool_search"]);
-		expect(plan.missingSearch).toBe(false);
+	it("unloads newly deferred declarations and activates native search", () => {
+		const result = planPolicy(["bash", "docs"], [tool("docs", "deferred"), search], { docs: "deferred" });
+		expect([...result.active]).toEqual(["bash", "tool_search"]);
+		expect(result.missingSearch).toBe(false);
 	});
-	it("does not unload native search matches on later syncs or reloads", () => {
-		const modes: ToolModes = { docs: "on-demand" };
-		const first = planPolicy(["read", "docs"], tools, modes);
-		const restored = lastPolicyState([{ type: "custom", customType: STATE_ENTRY, data: first.state }]);
-		const next = planPolicy(["read", "tool_search", "docs"], tools, modes, restored);
-		expect(next.active.has("docs")).toBe(true);
-		expect(stateEqual(first.state, next.state)).toBe(true);
+	it("activates the native script directory for codemode overrides", () => {
+		const result = planPolicy(["docs"], [tool("docs", "codemode"), search, codemode], { docs: "codemode" });
+		expect([...result.active]).toEqual(["tool_search", "codemode"]);
 	});
-	it("does not re-add tools another extension deactivated", () => {
-		const first = planPolicy(["read", "bash"], tools, { docs: "always", images: "on-demand" });
-		const next = planPolicy(["read", "tool_search"], tools,
-			{ docs: "always", images: "always" }, first.state);
-		expect(next.active.has("bash")).toBe(false);
-		expect(next.active.has("docs")).toBe(false);
-		expect(next.active.has("images")).toBe(true);
+	it("does not unload tools loaded by native search on later syncs", () => {
+		const first = planPolicy(["docs"], [tool("docs", "deferred"), search], { docs: "deferred" });
+		const later = planPolicy(["docs", "tool_search"], [tool("docs", "deferred"), search], { docs: "deferred" }, first.applied);
+		expect(later.active.has("docs")).toBe(true);
+		expect(exposuresEqual(first.applied, later.applied)).toBe(true);
 	});
-	it("returning to inherit releases control without rewinding the live set", () => {
-		const first = planPolicy(["read"], tools, { docs: "always" });
-		const next = planPolicy(first.active, tools, {}, first.state);
-		expect(next.active.has("docs")).toBe(true);
-		expect(next.state.appliedModes).toEqual({});
+	it("applies actual mode changes without resetting unrelated tools", () => {
+		const result = planPolicy([], [tool("docs"), tool("images", "deferred"), search], { docs: "direct", images: "deferred" },
+			{ docs: "direct", images: "direct" });
+		expect(result.active.has("docs")).toBe(false);
+		expect(result.active.has("bash")).toBe(false);
+		expect(result.active.has("images")).toBe(false);
 	});
-	it("ignores preferences for builtins, services, hidden and unadapted tools", () => {
-		const modes: ToolModes = { read: "on-demand", bash: "always", tool_search: "on-demand",
-			codemode: "on-demand", legacy: "on-demand", ask: "always", secret: "always" };
-		const plan = planPolicy(["read", "legacy", "codemode"], tools, modes);
-		expect([...plan.active]).toEqual(["read", "legacy", "codemode"]);
-		expect(plan.state.appliedModes).toEqual({});
+	it("rejects a fake exposure switch instead of merely hiding a direct tool", () => {
+		expect(() => planPolicy(["docs"], [tool("docs")], { docs: "deferred" })).toThrow("did not take effect");
 	});
-	it("never revives a missing or CLI-excluded tool", () => {
-		const plan = planPolicy(["read"], tools.filter((t) => t.name !== "docs"), { docs: "always" });
-		expect([...plan.active]).toEqual(["read"]);
+	it("restores native activation behavior when an override is removed", () => {
+		const direct = planPolicy([], [tool("docs")], {}, { docs: "deferred" });
+		expect(direct.active.has("docs")).toBe(true);
+		expect(direct.applied).toEqual({});
+		const deferred = planPolicy(["docs"], [tool("docs", "deferred")], {}, { docs: "direct" });
+		expect(deferred.active.has("docs")).toBe(false);
 	});
-	it("handles late native registration and conversion without modifying exposure", () => {
-		const first = planPolicy(["legacy"], tools, { legacy: "on-demand" });
-		const converted = tools.map((t) => t.name === "legacy" ? { ...t, exposure: "deferred" as const } : t);
-		const next = planPolicy(first.active, converted, { legacy: "on-demand" }, first.state);
-		expect(next.active.has("legacy")).toBe(false);
-		expect(next.active.has("tool_search")).toBe(true);
-		expect(converted.find((t) => t.name === "legacy")?.exposure).toBe("deferred");
+	it("ignores attempts to override protected tools", () => {
+		const result = planPolicy(["read"], [tool("read", "direct", "builtin"), search, codemode,
+			tool("hidden", "hidden"), tool("locked", "model-only"), tool("sdk", "direct", "sdk")],
+			{ read: "deferred", tool_search: "direct", codemode: "direct", hidden: "direct", locked: "direct", sdk: "deferred" });
+		expect([...result.active]).toEqual(["read"]);
+		expect(result.applied).toEqual({});
 	});
-	it("does not reapply on-demand when a known MCP tool is temporarily absent on resume", () => {
-		const modes: ToolModes = { docs: "on-demand" };
-		const first = planPolicy(["read"], tools, modes);
-		const disconnected = planPolicy(["read"], tools.filter((t) => t.name !== "docs"), modes, first.state);
-		const reconnected = planPolicy(["read", "docs"], tools, modes, disconnected.state);
-		expect(reconnected.active.has("docs")).toBe(true);
+	it("retains applied entries through temporary absence but applies changed overrides on return", () => {
+		const absent = planPolicy([], [], { docs: "direct" }, { docs: "deferred" });
+		expect(absent.applied).toEqual({ docs: "deferred" });
+		expect(absent.active.has("docs")).toBe(false);
+		const returned = planPolicy([], [tool("docs")], { docs: "direct" }, absent.applied);
+		expect(returned.active.has("docs")).toBe(true);
 	});
-	it("applies a changed preference when a disconnected tool reappears", () => {
-		const first = planPolicy([], tools, { docs: "on-demand" });
-		const absent = planPolicy([], [], { docs: "always" }, first.state);
-		const next = planPolicy([], tools, { docs: "always" }, absent.state);
-		expect(next.active.has("docs")).toBe(true);
+	it("reports missing host search and script orchestrators", () => {
+		const result = planPolicy([], [tool("docs", "codemode")], { docs: "codemode" });
+		expect(result.missingSearch).toBe(true);
+		expect(result.missingCodemode).toBe(true);
+		expect([...result.active]).toEqual([]);
 	});
-	it("warns when discovery is absent, and enables it when it arrives", () => {
-		const modes: ToolModes = { docs: "on-demand" };
-		const first = planPolicy(["docs"], tools.filter((t) => t.name !== "tool_search"), modes);
-		expect(first.missingSearch).toBe(true);
-		expect(first.active.has("tool_search")).toBe(false);
-		const next = planPolicy(first.active, tools, modes, first.state);
-		expect(next.active.has("tool_search")).toBe(true);
+	it("activates a late discovery service only once", () => {
+		const first = planPolicy([], [tool("docs", "deferred")], { docs: "deferred" });
+		const later = planPolicy([], [tool("docs", "deferred"), search], { docs: "deferred" }, first.applied, first.services);
+		expect(later.active.has("tool_search")).toBe(true);
+		const external = planPolicy([], [tool("docs", "deferred"), search], { docs: "deferred" }, later.applied, later.services);
+		expect(external.active.has("tool_search")).toBe(false);
 	});
-	it("takes policy from the active branch, not old tools-config snapshots", () => {
-		const state = planPolicy([], tools, { docs: "always" }).state;
-		expect(lastPolicyState([{ type: "custom", customType: "tools-config", data: { enabledTools: ["docs"] } }])).toBeUndefined();
-		expect(lastPolicyState([
-			{ type: "custom", customType: STATE_ENTRY, data: state },
-			{ type: "custom", customType: STATE_ENTRY, data: { appliedModes: { docs: "invalid" } } },
-		])).toEqual(state);
+	it("reads only valid policy snapshots from the active branch", () => {
+		expect(lastPolicyState([{ type: "custom", customType: "tools-loading-policy", data: { appliedModes: { docs: "always" } } },
+			{ type: "custom", customType: STATE_ENTRY, data: { applied: { docs: "deferred" }, services: ["tool_search"] } },
+			{ type: "custom", customType: STATE_ENTRY, data: { applied: { docs: "hidden" }, services: [] } }]))
+			.toEqual({ applied: { docs: "deferred" }, services: ["tool_search"] });
 	});
-	it("treats tool names as data, including object prototype keys", () => {
-		const special = [tool("__proto__"), tool("constructor")];
-		const modes = JSON.parse('{"__proto__":"always","constructor":"on-demand"}');
-		const plan = planPolicy(["constructor"], special, modes);
-		expect(plan.active.has("__proto__")).toBe(true);
-		expect(plan.active.has("constructor")).toBe(false);
-		expect(modeOf({}, "constructor")).toBe("inherit");
+	it("treats prototype keys as data", () => {
+		const overrides = JSON.parse('{"__proto__":"deferred","constructor":"direct"}');
+		const result = planPolicy([], [tool("__proto__", "deferred"), tool("constructor")], overrides);
+		expect(Object.hasOwn(result.applied, "__proto__")).toBe(true);
+		expect(result.active.has("constructor")).toBe(true);
+		expect(configuredExposure({}, "constructor", "direct")).toBe("direct");
 	});
-	it("compares names without order or duplicate sensitivity", () => {
-		expect(sameNames(["docs", "read", "read"], ["read", "docs"])).toBe(true);
-		expect(sameNames(["read"], [])).toBe(false);
+	it("compares maps and sets without depending on order", () => {
+		expect(exposuresEqual({ a: "direct", b: "deferred" }, { b: "deferred", a: "direct" })).toBe(true);
+		expect(exposuresEqual({}, { a: "direct" })).toBe(false);
+		expect(sameNames(["a", "a", "b"], ["b", "a"])).toBe(true);
 	});
 });

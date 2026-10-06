@@ -1,16 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { parseModes, type ToolModes } from "./shared.ts";
+import { parseExposures, type ToolExposures } from "./shared.ts";
 
 export const PREFS_FILE = "pi-tools.json";
 export type ConfigScope = "project" | "global";
 export interface ConfigResolution {
 	scope: ConfigScope;
 	path: string;
-	toolModes: ToolModes;
-	hasProjectConfig: boolean;
+	toolExposures: ToolExposures;
 	isEnvOverridden: boolean;
 }
 export function formatDisplayPath(filePath: string): string {
@@ -23,63 +22,46 @@ export function getGlobalConfigPath(): string {
 export function getProjectConfigPath(cwd: string): string {
 	return join(cwd, CONFIG_DIR_NAME, PREFS_FILE);
 }
-export function hasProjectConfig(cwd: string): boolean {
-	return existsSync(getProjectConfigPath(cwd));
-}
-/** Only the native loading-preference format is supported; no legacy disabledTools migration. */
-export function readConfigFile(filePath: string): ToolModes | undefined {
-	if (!existsSync(filePath)) return undefined;
+/** Only exposure overrides are read; old loading-policy formats are not migrated. */
+export function readConfigFile(filePath: string): ToolExposures | undefined {
 	try {
 		const parsed = JSON.parse(readFileSync(filePath, "utf8"));
-		return parsed && typeof parsed === "object" ? parseModes(parsed.toolModes) : undefined;
+		return parsed && typeof parsed === "object" ? parseExposures(parsed.toolExposures) : undefined;
 	} catch {
 		return undefined;
 	}
 }
-export function writeConfigFile(filePath: string, modes: ToolModes): void {
-	const normalized = parseModes(modes);
-	if (!normalized) throw new Error("Invalid tool loading preferences");
+export function writeConfigFile(filePath: string, exposures: ToolExposures): void {
+	const normalized = parseExposures(exposures);
+	if (!normalized) throw new Error("Invalid tool exposure overrides");
 	mkdirSync(dirname(filePath), { recursive: true });
 	const sorted = Object.fromEntries(Object.entries(normalized).sort(([a], [b]) => a.localeCompare(b)));
-	writeFileSync(filePath, `${JSON.stringify({ toolModes: sorted }, null, 2)}\n`, "utf8");
+	writeFileSync(filePath, `${JSON.stringify({ toolExposures: sorted }, null, 2)}\n`, "utf8");
 }
-export function readScopeConfig(scope: ConfigScope, cwd: string): ToolModes | undefined {
+export function readScopeConfig(scope: ConfigScope, cwd: string): ToolExposures | undefined {
 	return readConfigFile(process.env.PI_TOOLS_CONFIG ||
 		(scope === "project" ? getProjectConfigPath(cwd) : getGlobalConfigPath()));
 }
-/** Project config replaces global config; an empty map explicitly follows the extensions. */
-export function resolveEffectiveConfig(cwd: string, isProjectTrusted: boolean): ConfigResolution {
+/** Trusted project config replaces the global map, including an explicitly empty map. */
+export function resolveEffectiveConfig(cwd: string, trusted: boolean): ConfigResolution {
 	if (process.env.PI_TOOLS_CONFIG) {
-		return {
-			scope: "global", path: process.env.PI_TOOLS_CONFIG,
-			toolModes: readConfigFile(process.env.PI_TOOLS_CONFIG) ?? {},
-			hasProjectConfig: false, isEnvOverridden: true,
-		};
+		return { scope: "global", path: process.env.PI_TOOLS_CONFIG,
+			toolExposures: readConfigFile(process.env.PI_TOOLS_CONFIG) ?? {}, isEnvOverridden: true };
 	}
 	const projectPath = getProjectConfigPath(cwd);
-	const projectModes = isProjectTrusted ? readConfigFile(projectPath) : undefined;
-	if (projectModes !== undefined) {
-		return { scope: "project", path: projectPath, toolModes: projectModes,
-			hasProjectConfig: true, isEnvOverridden: false };
+	const project = trusted ? readConfigFile(projectPath) : undefined;
+	if (project !== undefined) {
+		return { scope: "project", path: projectPath, toolExposures: project, isEnvOverridden: false };
 	}
-	const globalPath = getGlobalConfigPath();
-	return { scope: "global", path: globalPath, toolModes: readConfigFile(globalPath) ?? {},
-		hasProjectConfig: hasProjectConfig(cwd), isEnvOverridden: false };
+	const path = getGlobalConfigPath();
+	return { scope: "global", path, toolExposures: readConfigFile(path) ?? {}, isEnvOverridden: false };
 }
-export function configFingerprint(cwd: string, isProjectTrusted: boolean): string {
-	const config = resolveEffectiveConfig(cwd, isProjectTrusted);
-	return JSON.stringify([config.path,
-		Object.entries(config.toolModes).sort(([a], [b]) => a.localeCompare(b))]);
+export function deleteProjectConfigFile(cwd: string): void {
+	rmSync(getProjectConfigPath(cwd), { force: true });
 }
-export function deleteProjectConfigFile(cwd: string): boolean {
-	const path = getProjectConfigPath(cwd);
-	if (!existsSync(path)) return false;
-	rmSync(path);
-	return true;
-}
-/** Preserve preferences for tools that are temporarily unavailable (e.g. disconnected MCP). */
-export function saveScopeConfig(options: { scope: ConfigScope; cwd: string; modes: ToolModes }): void {
+/** Unavailable-tool entries are intentionally preserved. */
+export function saveScopeConfig(options: { scope: ConfigScope; cwd: string; exposures: ToolExposures }): void {
 	const path = process.env.PI_TOOLS_CONFIG ||
 		(options.scope === "project" ? getProjectConfigPath(options.cwd) : getGlobalConfigPath());
-	writeConfigFile(path, options.modes);
+	writeConfigFile(path, options.exposures);
 }

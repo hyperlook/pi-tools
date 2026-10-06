@@ -2,16 +2,15 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { configFingerprint, deleteProjectConfigFile, getGlobalConfigPath, getProjectConfigPath,
+import { deleteProjectConfigFile, getGlobalConfigPath, getProjectConfigPath,
 	readConfigFile, readScopeConfig, resolveEffectiveConfig, saveScopeConfig, writeConfigFile } from "../src/config.ts";
 
-describe("native preference config", () => {
+describe("exposure override config", () => {
 	let dir: string, cwd: string, global: string;
 	let originalAgent: string | undefined, originalOverride: string | undefined;
 	beforeEach(() => {
 		dir = mkdtempSync(join(tmpdir(), "pi-tools-config-"));
-		cwd = join(dir, "project");
-		mkdirSync(cwd);
+		cwd = join(dir, "project"); mkdirSync(cwd);
 		originalAgent = process.env.PI_CODING_AGENT_DIR;
 		originalOverride = process.env.PI_TOOLS_CONFIG;
 		process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
@@ -25,74 +24,65 @@ describe("native preference config", () => {
 		else process.env.PI_TOOLS_CONFIG = originalOverride;
 		rmSync(dir, { recursive: true, force: true });
 	});
-	it("defaults to following extensions without config", () => {
-		expect(resolveEffectiveConfig(cwd, true).toolModes).toEqual({});
+	it("has no implicit overrides", () => {
+		expect(resolveEffectiveConfig(cwd, true).toolExposures).toEqual({});
 		expect(resolveEffectiveConfig(cwd, true).scope).toBe("global");
 	});
-	it("reads global preferences", () => {
-		writeConfigFile(global, { docs: "on-demand" });
-		expect(resolveEffectiveConfig(cwd, true).toolModes).toEqual({ docs: "on-demand" });
+	it("reads all three native exposure values", () => {
+		writeConfigFile(global, { old: "deferred", docs: "direct", image: "codemode" });
+		expect(resolveEffectiveConfig(cwd, true).toolExposures).toEqual({ old: "deferred", docs: "direct", image: "codemode" });
 	});
 	it("trusted project replaces the global map, including with an empty map", () => {
-		writeConfigFile(global, { docs: "always" });
+		writeConfigFile(global, { docs: "direct" });
 		writeConfigFile(getProjectConfigPath(cwd), {});
 		expect(resolveEffectiveConfig(cwd, true).scope).toBe("project");
-		expect(resolveEffectiveConfig(cwd, true).toolModes).toEqual({});
+		expect(resolveEffectiveConfig(cwd, true).toolExposures).toEqual({});
 	});
-	it("does not read untrusted project preferences", () => {
-		writeConfigFile(global, { docs: "always" });
-		writeConfigFile(getProjectConfigPath(cwd), { docs: "on-demand" });
-		expect(resolveEffectiveConfig(cwd, false).toolModes).toEqual({ docs: "always" });
+	it("never reads untrusted project overrides", () => {
+		writeConfigFile(global, { docs: "direct" });
+		writeConfigFile(getProjectConfigPath(cwd), { docs: "deferred" });
+		expect(resolveEffectiveConfig(cwd, false).toolExposures).toEqual({ docs: "direct" });
 	});
 	it("uses the environment path exclusively for reads and writes", () => {
+		writeConfigFile(global, { docs: "direct" });
 		process.env.PI_TOOLS_CONFIG = join(dir, "override.json");
-		writeConfigFile(global, { docs: "always" });
-		saveScopeConfig({ scope: "project", cwd, modes: { docs: "on-demand" } });
+		saveScopeConfig({ scope: "project", cwd, exposures: { docs: "deferred" } });
 		expect(resolveEffectiveConfig(cwd, true).isEnvOverridden).toBe(true);
-		expect(readScopeConfig("global", cwd)).toEqual({ docs: "on-demand" });
-		expect(readConfigFile(global)).toEqual({ docs: "always" });
+		expect(readScopeConfig("global", cwd)).toEqual({ docs: "deferred" });
+		expect(readConfigFile(global)).toEqual({ docs: "direct" });
 		expect(existsSync(getProjectConfigPath(cwd))).toBe(false);
 	});
-	it("falls back to global for malformed project config", () => {
-		writeConfigFile(global, { docs: "always" });
+	it("rejects invalid exposure values and malformed files", () => {
+		writeConfigFile(global, { docs: "direct" });
 		writeConfigFile(getProjectConfigPath(cwd), {});
-		writeFileSync(getProjectConfigPath(cwd), '{"toolModes":{"docs":"disabled"}}');
-		expect(resolveEffectiveConfig(cwd, true).scope).toBe("global");
-		writeFileSync(getProjectConfigPath(cwd), '{broken');
-		expect(readScopeConfig("project", cwd)).toBeUndefined();
+		for (const data of ['{"toolExposures":{"docs":"hidden"}}', '{broken', '{"toolExposures":[]}']) {
+			writeFileSync(getProjectConfigPath(cwd), data);
+			expect(readScopeConfig("project", cwd)).toBeUndefined();
+			expect(resolveEffectiveConfig(cwd, true).scope).toBe("global");
+		}
+		expect(() => writeConfigFile(global, { docs: "invalid" } as any)).toThrow();
 	});
-	it("does not migrate legacy disabledTools files", () => {
+	it("does not migrate any old loading-policy format", () => {
 		writeConfigFile(global, {});
-		writeFileSync(global, '{"disabledTools":["docs","enable_tool"]}');
-		expect(readConfigFile(global)).toBeUndefined();
-		expect(resolveEffectiveConfig(cwd, true).toolModes).toEqual({});
+		for (const data of ['{"disabledTools":["docs"]}', '{"toolModes":{"docs":"on-demand"}}']) {
+			writeFileSync(global, data);
+			expect(readConfigFile(global)).toBeUndefined();
+			expect(resolveEffectiveConfig(cwd, true).toolExposures).toEqual({});
+		}
 	});
-	it("normalizes explicit inherit entries and ignores map ordering in fingerprints", () => {
-		writeConfigFile(global, {});
-		writeFileSync(global, '{"toolModes":{"z":"always","a":"on-demand","docs":"inherit"}}');
-		const first = configFingerprint(cwd, true);
-		expect(readConfigFile(global)).toEqual({ z: "always", a: "on-demand" });
-		writeConfigFile(global, { a: "on-demand", z: "always" });
-		expect(configFingerprint(cwd, true)).toBe(first);
-		writeConfigFile(global, { a: "always", z: "always" });
-		expect(configFingerprint(cwd, true)).not.toBe(first);
-	});
-	it("preserves preferences for temporarily unavailable tools", () => {
-		saveScopeConfig({ scope: "global", cwd, modes: { disconnected_mcp: "on-demand", docs: "always" } });
-		expect(readConfigFile(global)).toEqual({ disconnected_mcp: "on-demand", docs: "always" });
+	it("preserves unavailable tools and sorts saved entries", () => {
+		saveScopeConfig({ scope: "global", cwd, exposures: { z: "deferred", a: "direct" } });
+		expect(Object.keys(readConfigFile(global)!)).toEqual(["a", "z"]);
 	});
 	it("resetting project restores global inheritance", () => {
-		writeConfigFile(global, { docs: "always" });
-		writeConfigFile(getProjectConfigPath(cwd), { docs: "on-demand" });
-		expect(deleteProjectConfigFile(cwd)).toBe(true);
-		expect(deleteProjectConfigFile(cwd)).toBe(false);
-		expect(resolveEffectiveConfig(cwd, true).toolModes).toEqual({ docs: "always" });
+		writeConfigFile(global, { docs: "direct" });
+		writeConfigFile(getProjectConfigPath(cwd), { docs: "deferred" });
+		deleteProjectConfigFile(cwd); deleteProjectConfigFile(cwd);
+		expect(resolveEffectiveConfig(cwd, true).toolExposures).toEqual({ docs: "direct" });
 	});
-	it("validates maps and supports arbitrary tool names safely", () => {
-		writeConfigFile(global, JSON.parse('{"__proto__":"on-demand"}'));
+	it("treats prototype keys as tool names", () => {
+		writeConfigFile(global, JSON.parse('{"__proto__":"deferred","constructor":"codemode"}'));
 		expect(Object.hasOwn(readConfigFile(global)!, "__proto__")).toBe(true);
-		writeFileSync(global, '{"toolModes":[]}');
-		expect(readConfigFile(global)).toBeUndefined();
-		expect(() => writeConfigFile(global, { docs: "invalid" } as any)).toThrow();
+		expect(readConfigFile(global)!.constructor).toBe("codemode");
 	});
 });

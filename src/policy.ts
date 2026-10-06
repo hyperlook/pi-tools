@@ -1,83 +1,64 @@
-import type { ToolExposure, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { exposureOf, isManageable, modeOf, parseModes, SEARCH_TOOL_NAME, type ToolModes } from "./shared.ts";
+import type { ToolInfo } from "@earendil-works/pi-coding-agent";
+import { exposureOf, exposuresEqual, isManageable, parseExposures, SEARCH_TOOL_NAME, type ToolExposures } from "./shared.ts";
 
-export const STATE_ENTRY = "tools-loading-policy";
-/** Only policy application is persisted. Pi owns the active tools and search-loaded branch state. */
+export const STATE_ENTRY = "tools-exposure-policy";
 export interface PolicyState {
-	appliedModes: ToolModes;
-	knownTools: Record<string, ToolExposure>;
+	applied: ToolExposures;
+	services: string[];
 }
-export interface PolicyPlan {
+export interface PolicyPlan extends PolicyState {
 	active: Set<string>;
-	state: PolicyState;
 	missingSearch: boolean;
+	missingCodemode: boolean;
 }
-const EXPOSURES = ["direct", "model-only", "deferred", "codemode", "hidden"];
-export function lastPolicyState(entries: readonly { type: string; customType?: string; data?: unknown }[]): PolicyState | undefined {
-	let state: PolicyState | undefined;
+export function lastPolicyState(entries: readonly { type: string; customType?: string; data?: unknown }[]): PolicyState {
+	let state: PolicyState = { applied: {}, services: [] };
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== STATE_ENTRY || !entry.data || typeof entry.data !== "object") continue;
-		const data = entry.data as { appliedModes?: unknown; knownTools?: unknown };
-		const modes = parseModes(data.appliedModes);
-		if (!modes || !data.knownTools || typeof data.knownTools !== "object" || Array.isArray(data.knownTools)) continue;
-		const known = Object.entries(data.knownTools);
-		if (known.some(([, exposure]) => !EXPOSURES.includes(exposure))) continue;
-		state = { appliedModes: modes, knownTools: Object.fromEntries(known) as Record<string, ToolExposure> };
+		const data = entry.data as Partial<PolicyState>;
+		const applied = parseExposures(data.applied);
+		if (applied && Array.isArray(data.services) && data.services.every((s) => s === SEARCH_TOOL_NAME || s === "codemode")) {
+			state = { applied, services: data.services };
+		}
 	}
 	return state;
 }
-
-/**
- * Apply preference transitions to the live set, never rebuild it from a frozen baseline.
- * Unchanged on-demand preferences must not unload tools found by native tool_search.
- * Unchanged always preferences must not undo another extension's runtime deactivation.
- * Returning to inherit releases control; it does not rewind Pi's current loadout.
- */
-export function planPolicy(
-	activeNames: Iterable<string>,
-	tools: readonly ToolInfo[],
-	modes: ToolModes,
-	previous?: PolicyState,
-): PolicyPlan {
+/** Change only newly applied exposures; Pi owns search-loaded tools and branch restoration. */
+export function planPolicy(activeNames: Iterable<string>, tools: readonly ToolInfo[], overrides: ToolExposures,
+	previous: ToolExposures = {}, previousServices: readonly string[] = []): PolicyPlan {
 	const active = new Set(activeNames);
-	const appliedModes = new Map(Object.entries(previous?.appliedModes ?? {}));
-	const knownTools = new Map(Object.entries(previous?.knownTools ?? {}));
-	let appliedOnDemand = false;
-	let hasOnDemand = false;
+	const applied = new Map(Object.entries(previous));
+	let changedLazy = false;
+	let changedCodemode = false;
+	let hasLazy = false;
+	let hasCodemode = false;
 	for (const tool of tools) {
-		const exposure = exposureOf(tool);
-		if (isManageable(tool)) {
-			const mode = modeOf(modes, tool.name);
-			const changed = mode !== modeOf(previous?.appliedModes ?? {}, tool.name) ||
-				knownTools.get(tool.name) !== exposure;
-			if (mode === "on-demand") {
-				hasOnDemand = true;
-				if (changed) { active.delete(tool.name); appliedOnDemand = true; }
-			} else if (mode === "always" && changed) {
-				active.add(tool.name);
-			}
-			if (mode === "inherit") appliedModes.delete(tool.name);
-			else appliedModes.set(tool.name, mode);
+		if (!isManageable(tool)) continue;
+		const target = Object.hasOwn(overrides, tool.name) ? overrides[tool.name] : undefined;
+		const before = Object.hasOwn(previous, tool.name) ? previous[tool.name] : undefined;
+		if (target && exposureOf(tool) !== target) {
+			throw new Error(`pi-tools: exposure override for ${tool.name} did not take effect (expected ${target}, got ${exposureOf(tool)})`);
 		}
-		knownTools.set(tool.name, exposure);
+		if (target !== before) {
+			if (exposureOf(tool) === "direct") active.add(tool.name);
+			else { active.delete(tool.name); changedLazy = true; }
+			changedCodemode ||= target === "codemode";
+		}
+		if (target) applied.set(tool.name, target);
+		else applied.delete(tool.name);
+		hasLazy ||= target === "deferred" || target === "codemode";
+		hasCodemode ||= target === "codemode";
 	}
-	const search = tools.find((tool) => tool.name === SEARCH_TOOL_NAME && exposureOf(tool) !== "hidden");
-	// Enable the host's existing discovery tool only when applying an explicit on-demand preference.
-	// A later registration is also handled; we never register a replacement tool or revive excluded tools.
-	if (search && hasOnDemand && (appliedOnDemand || previous?.knownTools[SEARCH_TOOL_NAME] !== exposureOf(search))) {
-		active.add(SEARCH_TOOL_NAME);
-	}
-	return { active, state: { appliedModes: Object.fromEntries(appliedModes), knownTools: Object.fromEntries(knownTools) },
-		missingSearch: hasOnDemand && !search };
+	const available = (name: string) => tools.some((t) => t.name === name && exposureOf(t) !== "hidden");
+	// Existing orchestrators only. Do not repeatedly undo other extensions' runtime choices.
+	if (hasLazy && (changedLazy || !previousServices.includes(SEARCH_TOOL_NAME)) && available(SEARCH_TOOL_NAME)) active.add(SEARCH_TOOL_NAME);
+	if (hasCodemode && (changedCodemode || !previousServices.includes("codemode")) && available("codemode")) active.add("codemode");
+	const services = [...new Set([...previousServices, ...[SEARCH_TOOL_NAME, "codemode"].filter(available)])];
+	return { active, applied: Object.fromEntries(applied), services,
+		missingSearch: hasLazy && !available(SEARCH_TOOL_NAME), missingCodemode: hasCodemode && !available("codemode") };
 }
 export function sameNames(a: Iterable<string>, b: Iterable<string>): boolean {
 	const left = new Set(a), right = new Set(b);
 	return left.size === right.size && [...left].every((name) => right.has(name));
 }
-export function stateEqual(a: PolicyState | undefined, b: PolicyState): boolean {
-	const canonical = (state: PolicyState | undefined) => state && JSON.stringify([
-		Object.entries(state.appliedModes).sort(([a], [b]) => a.localeCompare(b)),
-		Object.entries(state.knownTools).sort(([a], [b]) => a.localeCompare(b)),
-	]);
-	return canonical(a) === canonical(b);
-}
+export { exposuresEqual };

@@ -1,7 +1,7 @@
 {
   "name": "pi-tools",
-  "version": "2.0.0",
-  "description": "Pi 原生工具加载偏好面板：跟随扩展、常驻或按需，使用系统 tool_search",
+  "version": "3.0.0",
+  "description": "Pi 工具 Exposure 管理面板：覆盖 direct / codemode / deferred，使用原生搜索与执行",
   "type": "module",
   "main": "src/index.ts",
   "keywords": [

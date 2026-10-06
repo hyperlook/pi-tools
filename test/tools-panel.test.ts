@@ -6,117 +6,118 @@ import { createToolsPanel, sortTools, type ToolsPanelOptions, type ToolsPanelSav
 const theme = { fg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
 const kb = { matches: () => false } as unknown as KeybindingsManager;
 const tui = { requestRender() {} } as TUI;
-function tool(name: string, exposure: ToolInfo["exposure"] = "deferred", source = "npm:example"): ToolInfo {
+function tool(name: string, exposure: ToolInfo["exposure"] = "direct", source = "npm:example"): ToolInfo {
 	return { name, exposure, description: `Description of ${name}`, parameters: { type: "object" }, sourceInfo: { source } };
 }
 function setup(overrides: Partial<ToolsPanelOptions> = {}) {
 	let saved: ToolsPanelSaveResult | undefined, closed = false;
 	const panel = createToolsPanel({
-		tui, theme, kb, done: () => { closed = true; }, tools: [tool("docs")], activeNames: new Set(),
+		tui, theme, kb, done: (result) => { saved = result; closed = true; }, tools: [tool("docs")],
+		originalExposures: new Map(), activeNames: new Set(),
 		initialScope: "global", canUseProjectScope: true, projectDisplayPath: ".pi/pi-tools.json",
-		globalDisplayPath: "~/.pi/agent/pi-tools.json", initialGlobalModes: {}, initialProjectModes: undefined,
-		onSave: (result) => { saved = result; }, ...overrides,
+		globalDisplayPath: "~/.pi/agent/pi-tools.json", initialGlobalExposures: {}, initialProjectExposures: undefined,
+		...overrides,
 	});
-	return { panel, saved: () => saved, closed: () => closed, text: () => panel.render(120).join("\n") };
+	return { panel, saved: () => saved, closed: () => closed, text: () => panel.render(160).join("\n") };
 }
-describe("three-state native preference panel", () => {
-	it("cycles follow, always, on-demand, follow and removes the override", () => {
+describe("three native exposure choices", () => {
+	it("makes unconfigured direct tools editable and cycles direct, codemode, deferred", () => {
 		const test = setup();
-		expect(test.text()).toContain("跟随扩展");
+		expect(test.text()).toContain("docs  direct");
+		expect(test.text()).not.toContain("只读");
 		test.panel.handleInput(" ");
-		expect(test.text()).toContain("常驻");
-		expect(test.text()).toContain("未保存 *");
+		expect(test.text()).toContain("docs  codemode *");
 		test.panel.handleInput(" ");
-		expect(test.text()).toContain("按需");
+		expect(test.text()).toContain("docs  deferred *");
 		test.panel.handleInput(" ");
-		expect(test.text()).not.toContain("未保存 *");
 		test.panel.handleInput("\r");
-		expect(test.saved()?.globalModes).toEqual({});
+		expect(test.saved()?.globalExposures).toEqual({ docs: "direct" });
 	});
-	it("keeps draft edits off disk until save", () => {
+	it("starts from the author's exposure, not a synthetic inherit state", () => {
+		const test = setup({ tools: [tool("docs", "deferred")] });
+		expect(test.text()).toContain("docs  deferred");
+		test.panel.handleInput(" "); test.panel.handleInput("\r");
+		expect(test.saved()?.globalExposures).toEqual({ docs: "direct" });
+	});
+	it("can reset to the original definition rather than the already-overridden effective exposure", () => {
+		const test = setup({ tools: [tool("docs", "deferred")], originalExposures: new Map([["docs", "direct"]]),
+			initialGlobalExposures: { docs: "deferred" } });
+		test.panel.handleInput("d");
+		expect(test.text()).toContain("target: direct");
+		expect(test.text()).toContain("current: deferred");
+		test.panel.handleInput("\r");
+		expect(test.saved()?.globalExposures).toEqual({});
+	});
+	it("keeps changes in a draft until completion", () => {
 		const test = setup();
 		test.panel.handleInput(" ");
 		expect(test.saved()).toBeUndefined();
-		test.panel.handleInput("\r");
-		expect(test.saved()?.globalModes).toEqual({ docs: "always" });
+		expect(test.text()).toContain("unsaved *");
+		test.panel.handleInput("d");
+		expect(test.text()).not.toContain("unsaved *");
+		test.panel.handleInput(" "); test.panel.handleInput("\r");
+		expect(test.saved()?.globalExposures).toEqual({ docs: "codemode" });
 		expect(test.closed()).toBe(true);
 	});
 	it("cancels drafts with q or Escape", () => {
 		for (const key of ["q", "\x1b"]) {
-			const test = setup();
-			test.panel.handleInput(" ");
-			test.panel.handleInput(key);
-			expect(test.saved()).toBeUndefined();
-			expect(test.closed()).toBe(true);
+			const test = setup(); test.panel.handleInput(" "); test.panel.handleInput(key);
+			expect(test.saved()).toBeUndefined(); expect(test.closed()).toBe(true);
 		}
 	});
-	it("forks project preferences from global on first edit", () => {
-		const test = setup({ initialScope: "project", initialGlobalModes: { docs: "always", absent: "on-demand" } });
-		expect(test.text()).toContain("继承全局");
-		test.panel.handleInput(" ");
-		expect(test.text()).toContain("已定制");
-		test.panel.handleInput("\r");
-		expect(test.saved()).toEqual({ globalModes: { docs: "always", absent: "on-demand" },
-			projectModes: { docs: "on-demand", absent: "on-demand" } });
+	it("forks project overrides from global on the first edit", () => {
+		const test = setup({ initialScope: "project", initialGlobalExposures: { docs: "direct", offline: "deferred" } });
+		expect(test.text()).toContain("inherit global");
+		test.panel.handleInput(" "); test.panel.handleInput("\r");
+		expect(test.saved()).toEqual({ globalExposures: { docs: "direct", offline: "deferred" },
+			projectExposures: { docs: "codemode", offline: "deferred" } });
 	});
-	it("resets project preferences to global inheritance", () => {
-		const test = setup({ initialScope: "project", initialProjectModes: { docs: "always" } });
-		test.panel.handleInput("r");
-		expect(test.text()).toContain("继承全局");
-		test.panel.handleInput("\r");
-		expect(test.saved()?.projectModes).toBeUndefined();
+	it("resets project overrides to global inheritance", () => {
+		const test = setup({ initialScope: "project", initialProjectExposures: { docs: "direct" } });
+		test.panel.handleInput("r"); expect(test.text()).toContain("inherit global"); test.panel.handleInput("\r");
+		expect(test.saved()?.projectExposures).toBeUndefined();
 	});
-	it("lets deferred and codemode tools be edited, but not direct or model-only tools", () => {
-		for (const exposure of ["deferred", "codemode", "direct", "model-only", "hidden"] as const) {
+	it("edits all three ordinary exposures, but protects model-only and hidden", () => {
+		for (const exposure of ["direct", "codemode", "deferred", "model-only", "hidden"] as const) {
 			const test = setup({ tools: [tool("docs", exposure)] });
-			test.panel.handleInput(" ");
-			test.panel.handleInput("\r");
-			expect(test.saved()?.globalModes).toEqual(
-				exposure === "deferred" || exposure === "codemode" ? { docs: "always" } : {});
+			test.panel.handleInput(" "); test.panel.handleInput("\r");
+			expect(test.saved()?.globalExposures).toEqual({ direct: { docs: "codemode" }, codemode: { docs: "deferred" },
+				deferred: { docs: "direct" }, "model-only": {}, hidden: {} }[exposure]);
 		}
 	});
-	it("shows why unadapted tools are readonly", () => {
-		const test = setup({ tools: [tool("old", "direct")] });
-		test.panel.handleInput(" ");
-		expect(test.text()).toContain("需由工具所属扩展适配 deferred");
-		expect(test.text()).toContain("只读");
-	});
-	it("does not edit builtins or native orchestrators", () => {
-		for (const entry of [tool("read", "direct", "builtin"), tool("tool_search", "model-only"), tool("codemode", "model-only")]) {
-			const test = setup({ tools: [entry] });
-			test.panel.handleInput(" ");
-			test.panel.handleInput("\r");
-			expect(test.saved()?.globalModes).toEqual({});
+	it("protects builtins, SDK-only tools and dispatchers", () => {
+		for (const entry of [tool("read", "direct", "builtin"), tool("sdk", "direct", "sdk"),
+			tool("tool_search", "model-only"), tool("codemode", "model-only")]) {
+			const test = setup({ tools: [entry] }); test.panel.handleInput(" "); test.panel.handleInput("\r");
+			expect(test.saved()?.globalExposures).toEqual({});
+			expect(test.text()).toContain("readonly");
 		}
 	});
-	it("locks project scope for untrusted projects or an env override", () => {
+	it("locks project scope when untrusted or overridden by environment", () => {
 		for (const opts of [{ canUseProjectScope: false }, { isEnvOverridden: true }]) {
-			const test = setup(opts);
-			test.panel.handleInput("\t");
-			expect(test.text()).toContain("Global");
+			const test = setup(opts); test.panel.handleInput("\t"); expect(test.text()).toContain("Global");
 		}
 	});
-	it("separates configured preference from current declaration state", () => {
-		const test = setup({ initialGlobalModes: { docs: "on-demand" }, activeNames: new Set(["docs"]) });
-		expect(test.text()).toContain("按需 · 已声明");
+	it("shows declaration status independently from exposure", () => {
+		const test = setup({ initialGlobalExposures: { docs: "deferred" }, activeNames: new Set(["docs"]) });
+		expect(test.text()).toContain("●");
+		expect(test.text()).toContain("deferred *");
+		expect(test.text()).toContain("Enter save & reload");
 	});
-	it("keeps every line within narrow widths, including Chinese and ANSI", () => {
+	it("fits narrow terminal widths with Chinese and ANSI", () => {
 		const ansiTheme = { fg: (_: string, text: string) => `\x1b[36m${text}\x1b[0m`,
 			bold: (text: string) => `\x1b[1m${text}\x1b[0m` } as Theme;
 		const test = setup({ tools: [tool("很长的中文工具名称".repeat(4))], theme: ansiTheme });
-		for (const width of [0, 1, 8, 24, 80]) {
-			for (const line of test.panel.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-		}
+		for (const width of [0, 1, 8, 24, 80]) for (const line of test.panel.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 	});
-	it("handles an empty list and preserves unavailable-tool preferences", () => {
-		const test = setup({ tools: [], initialGlobalModes: { offline: "on-demand" } });
-		for (const key of ["j", "k", " "]) test.panel.handleInput(key);
-		expect(test.text()).toContain("没有已注册的工具");
-		test.panel.handleInput("\r");
-		expect(test.saved()?.globalModes).toEqual({ offline: "on-demand" });
+	it("preserves unavailable-tool overrides even with an empty list", () => {
+		const test = setup({ tools: [], initialGlobalExposures: { offline: "deferred" } });
+		for (const key of ["j", "k", " ", "d"]) test.panel.handleInput(key);
+		expect(test.text()).toContain("No registered tools found"); test.panel.handleInput("\r");
+		expect(test.saved()?.globalExposures).toEqual({ offline: "deferred" });
 	});
-	it("sorts builtins, services, native tools then unsupported tools", () => {
-		const sorted = sortTools([tool("old", "direct"), tool("docs"), tool("tool_search", "model-only"), tool("read", "direct", "builtin")]);
+	it("sorts direct and native tools together after builtin and service tools", () => {
+		const sorted = sortTools([tool("old"), tool("docs", "deferred"), tool("tool_search", "model-only"), tool("read", "direct", "builtin")]);
 		expect(sorted.map((t) => t.name)).toEqual(["read", "tool_search", "docs", "old"]);
 	});
 });
