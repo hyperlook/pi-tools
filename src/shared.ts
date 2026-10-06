@@ -21,7 +21,10 @@ export function prevExposure(mode: ExposureMode): ExposureMode {
 	return EXPOSURE_MODES[(EXPOSURE_MODES.indexOf(mode) + EXPOSURE_MODES.length - 1) % EXPOSURE_MODES.length]!;
 }
 export function firstSentence(text: string | undefined): string {
-	return (text?.match(/^.+?(?:[。！!？?]|(?:\.\s)|\.$|$)/)?.[0] ?? text ?? "").trim();
+	// Descriptions may start with Markdown headings and span several paragraphs.
+	// Flatten before matching: a failed dot-match must never leak newlines into a TUI row.
+	const plain = (text ?? "").replace(/^#{1,6}[^\r\n]*(?:\r?\n|$)/gm, " ").replace(/\s+/gu, " ").trim();
+	return (plain.match(/^.+?(?:[。！!？?]|(?:\.\s)|\.$|$)/)?.[0] ?? plain).trim();
 }
 export function isSupported(toolOrName: ToolInfo | string): boolean {
 	const name = typeof toolOrName === "string" ? toolOrName : toolOrName.name;

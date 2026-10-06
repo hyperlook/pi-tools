@@ -1,6 +1,6 @@
 import type { KeybindingsManager, Theme, ToolExposure, ToolInfo } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
-import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ConfigScope } from "./config.ts";
 import { configuredExposure, exposureOf, firstSentence, isExposureMode, isManageable, lockReason,
 	nextExposure, prevExposure, toolKind, type ToolExposures, type ToolKind } from "./shared.ts";
@@ -16,12 +16,14 @@ const MODE_HINTS: Record<string, string> = {
 	deferred: "deferred: hidden until found via tool_search",
 };
 
-export type PanelAction = "up" | "down" | "pageUp" | "pageDown" | "next" | "prev" | "toggleScope" | "resetProject" | "resetTool" | "save" | "cancel";
+export type PanelAction = "up" | "down" | "pageUp" | "pageDown" | "first" | "last" | "next" | "prev" | "toggleScope" | "resetProject" | "resetTool" | "save" | "cancel";
 export function readAction(kb: KeybindingsManager, data: string): PanelAction | undefined {
 	if (kb.matches(data, "tui.select.up") || data === "k") return "up";
 	if (kb.matches(data, "tui.select.down") || data === "j") return "down";
 	if (kb.matches(data, "tui.select.pageUp")) return "pageUp";
 	if (kb.matches(data, "tui.select.pageDown")) return "pageDown";
+	if (matchesKey(data, Key.home)) return "first";
+	if (matchesKey(data, Key.end)) return "last";
 	if (data === " ") return "next";
 	if (matchesKey(data, Key.right)) return "next";
 	if (matchesKey(data, Key.left)) return "prev";
@@ -62,6 +64,7 @@ function plural(n: number, word: string): string {
 export function createToolsPanel(opts: ToolsPanelOptions) {
 	const { tui, theme, kb, done, tools, activeNames } = opts;
 	let selected = 0;
+	let start = 0;
 	let scope = opts.initialScope;
 	const drafts: Record<ConfigScope, ToolExposures> = { global: { ...opts.initialGlobalExposures }, project: { ...opts.initialProjectExposures } };
 	let notice = "";
@@ -78,38 +81,49 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 	const hasOwn = (tool: ToolInfo) => Object.hasOwn(drafts[scope], tool.name);
 	const shadowed = (tool: ToolInfo) => scope === "global" && Object.hasOwn(drafts.project, tool.name);
 	const changes = () => changedCount(drafts.global, opts.initialGlobalExposures) + changedCount(drafts.project, opts.initialProjectExposures);
-	const firstLocked = tools.findIndex((t) => !isManageable(t));
+	const editableCount = tools.filter(isManageable).length;
+	const singleLine = (text: string) => text.replace(/\s+/gu, " ").trim();
+	const nameWidth = tools.reduce((max, tool) => Math.max(max, visibleWidth(singleLine(tool.name))), 0);
+	function layout() {
+		const rows = tui.terminal?.rows ?? 30;
+		const compact = rows < 22;
+		// Reserve two rows for the host UI. All non-list regions have stable heights.
+		const fixedRows = compact ? 12 : 15;
+		return { compact, tooShort: rows < 15, height: Math.min(12, Math.max(1, rows - 2 - fixedRows)) };
+	}
 	const accent = (text: string) => theme.fg("accent", text);
 	const dim = (text: string) => theme.fg("dim", text);
 	return {
 		invalidate() {},
 		render(width: number): string[] {
 			const projectEmpty = !Object.keys(drafts.project).length;
-			const height = Math.min(tools.length, 12);
-			const start = Math.max(0, Math.min(selected - Math.floor(height / 2), tools.length - height));
+			const { compact, tooShort, height: pageSize } = layout();
+			const fit = (line: string) => truncateToWidth(singleLine(line), Math.max(0, width));
+			if (tooShort) return [theme.bold(accent("Tool Exposure")), "Enlarge terminal to at least 15 rows", "Enter save & reload · Esc cancel"].map(fit);
+			const height = Math.min(Math.max(1, tools.length), pageSize);
+			// Scroll only at the viewport edges; moving within it leaves the list stationary.
+			start = Math.max(0, Math.min(start, selected, Math.max(0, tools.length - height)));
+			if (selected >= start + height) start = selected - height + 1;
 			const tab = (name: ConfigScope, label: string) => scope === name ? theme.bold(accent(`[${label}]`)) : dim(` ${label} `);
-			const barWidth = Math.max(0, Math.min(width, 70));
+			const barWidth = Math.max(0, width);
+			const rule = (label = "") => {
+				const prefix = truncateToWidth(label ? `─ ${label} ` : "", barWidth);
+				return dim(prefix + "─".repeat(Math.max(0, barWidth - visibleWidth(prefix))));
+			};
 			const lines = [
 				theme.bold(accent("Tool Exposure")),
 				`${tab("global", "Global")} ${tab("project", "Project")}${opts.isEnvOverridden ? dim("  PI_TOOLS_CONFIG in use") : !opts.canUseProjectScope ? dim("  project untrusted") : ""}`,
-				dim(scope === "project" ? `${opts.projectDisplayPath}${projectEmpty ? " · no overrides, inheriting global" : ""}` : opts.globalDisplayPath),
-				"",
+				...(!compact ? [dim(scope === "project" ? `${opts.projectDisplayPath}${projectEmpty ? " · no overrides, inheriting global" : ""}` : opts.globalDisplayPath), ""] : []),
 			];
-			const nameCol = Math.min(28, Math.max(0, ...tools.map((t) => t.name.length)));
+			const nameCol = Math.min(28, Math.max(4, nameWidth), Math.max(4, width - 40));
 			const modeCol = 22;
 			lines.push(dim(`    ${"tool".padEnd(nameCol)}  ${"mode".padEnd(modeCol)}  source`));
-			lines.push(dim("─".repeat(barWidth)));
-			for (let i = start; i < start + height; i++) {
+			lines.push(rule(`editable (${editableCount}) · locked (${tools.length - editableCount})`));
+			for (let i = start; i < Math.min(tools.length, start + height); i++) {
 				const tool = tools[i]!;
-				if (i === firstLocked && i > 0) {
-					const tag = ` locked (${tools.length - i}) `;
-					const remaining = Math.max(0, barWidth - tag.length);
-					const left = Math.floor(remaining / 2);
-					const right = remaining - left;
-					lines.push(dim(`${"─".repeat(left)}${tag}${"─".repeat(right)}`));
-				}
 				const dot = activeNames.has(tool.name) ? theme.fg("success", "●") : dim("○");
-				const nameText = tool.name.padEnd(nameCol, " ");
+				const clippedName = truncateToWidth(singleLine(tool.name), nameCol);
+				const nameText = clippedName + " ".repeat(Math.max(0, nameCol - visibleWidth(clippedName)));
 				const name = i === selected ? theme.bold(nameText) : nameText;
 				let modeText: string, sourceText: string;
 				if (isManageable(tool)) {
@@ -127,36 +141,45 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 			}
 			if (!tools.length) lines.push(theme.fg("muted", "No registered tools found"));
 			const tool = tools[selected];
-			lines.push("", dim("─".repeat(barWidth)));
+			const end = Math.min(tools.length, start + height);
+			lines.push(rule(tools.length ? `${start + 1}–${end} / ${tools.length}${start > 0 ? " · ↑ more" : ""}${end < tools.length ? " · ↓ more" : ""}` : "0 tools"));
+			// Each detail owns exactly one physical terminal row, including locked/empty states.
+			const details = ["", "", "", ""];
 			if (tool) {
-				lines.push(theme.bold(tool.name), firstSentence(tool.description) || "(no description)");
 				const reason = lockReason(tool);
-				if (reason) lines.push(theme.fg("warning", reason));
-				else {
-					const { mode } = resolve(tool);
-					lines.push(theme.fg("muted", [`default: ${original(tool)}`, `live: ${exposureOf(tool)}`,
-						activeNames.has(tool.name) ? "loaded in context" : "not loaded"].join(" · ")), dim(MODE_HINTS[mode]!));
-				}
+				const { mode } = resolve(tool);
+				details[0] = theme.bold(singleLine(tool.name));
+				details[1] = firstSentence(tool.description) || "(no description)";
+				details[2] = reason ? theme.fg("warning", reason) : theme.fg("muted", [`default: ${original(tool)}`, `live: ${exposureOf(tool)}`,
+					activeNames.has(tool.name) ? "loaded in context" : "not loaded"].join(" · "));
+				details[3] = reason ? dim(activeNames.has(tool.name) ? "loaded in context" : "not loaded") : dim(MODE_HINTS[mode] ?? "");
 			}
+			lines.push(...details.slice(0, compact ? 3 : 4));
 			const n = changes();
 			const selectedTool = tool && isManageable(tool) ? tool : undefined;
 			const fmt = (keys: (string[] | false)[]) => keys.filter((k): k is string[] => !!k)
 				.map(([k, v]) => `${accent(k!)} ${dim(v!)}`).join(dim(" · "));
-			lines.push("",
-				fmt([["↑↓/jk", "move"], ["←→/Space", "change mode"], !!selectedTool && hasOwn(selectedTool) && ["d", "clear override"],
+			lines.push(notice ? theme.fg("warning", notice) : "",
+				fmt([["↑↓/jk", "move"], ["PgUp/PgDn", "page"], ["Home/End", "first/last"]]),
+				fmt([!!selectedTool && ["←→/Space", "change mode"], !!selectedTool && hasOwn(selectedTool) && ["d", "clear override"],
 					scope === "project" && !projectEmpty && ["r", "clear all project overrides"]]),
 				fmt([["Tab", `scope → ${scope === "global" ? "project" : "global"}`],
 					["Enter", `save & reload${n ? ` (${plural(n, "change")})` : ""}`], ["Esc", "cancel"]]));
-			if (notice) lines.push(theme.fg("warning", notice));
-			return lines.map((line) => truncateToWidth(line, Math.max(0, width)));
+			// Do not collapse layout padding; only normalize embedded row-breaking characters.
+			return lines.map((line) => truncateToWidth(line.replace(/[\r\n\t\u2028\u2029]+/gu, " "), Math.max(0, width)));
 		},
 		handleInput(data: string) {
 			const action = readAction(kb, data);
 			if (!action) return;
 			if (action === "cancel") { done(undefined); return; }
 			if (action === "save") { done({ globalExposures: { ...drafts.global }, projectExposures: { ...drafts.project } }); return; }
-			if (action === "up" || action === "pageUp") selected = Math.max(0, selected - (action === "up" ? 1 : 8));
-			if (action === "down" || action === "pageDown") selected = Math.max(0, Math.min(tools.length - 1, selected + (action === "down" ? 1 : 8)));
+			if (layout().tooShort) return; // Never edit a selection that cannot be seen.
+			notice = "";
+			const pageSize = layout().height;
+			if (action === "up" || action === "pageUp") selected = Math.max(0, selected - (action === "up" ? 1 : pageSize));
+			if (action === "down" || action === "pageDown") selected = Math.max(0, Math.min(tools.length - 1, selected + (action === "down" ? 1 : pageSize)));
+			if (action === "first") selected = 0;
+			if (action === "last") selected = Math.max(0, tools.length - 1);
 			if (action === "toggleScope") {
 				if (opts.isEnvOverridden) notice = "PI_TOOLS_CONFIG overrides config file location";
 				else if (!opts.canUseProjectScope) notice = "Project untrusted; cannot edit project config";

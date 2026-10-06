@@ -1,10 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import type { KeybindingsManager, Theme, ToolInfo } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, visibleWidth } from "@earendil-works/pi-tui";
+import { firstSentence } from "../src/shared.ts";
 import { createToolsPanel, sortTools, type ToolsPanelOptions, type ToolsPanelSaveResult } from "../src/tools-panel.ts";
 const theme = { fg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
-const kb = { matches: () => false } as unknown as KeybindingsManager;
+const kb = { matches: (data: string, action: string) => {
+	if (action === "tui.select.pageUp") return matchesKey(data, Key.pageUp);
+	if (action === "tui.select.pageDown") return matchesKey(data, Key.pageDown);
+	return false;
+} } as unknown as KeybindingsManager;
 const tui = { requestRender() {} } as TUI;
 function tool(name: string, exposure: ToolInfo["exposure"] = "direct", source = "npm:example"): ToolInfo {
 	return { name, exposure, description: `Description of ${name}`, parameters: { type: "object" }, sourceInfo: { source } };
@@ -143,6 +148,121 @@ describe("layered exposure panel", () => {
 		for (const key of ["j", "k", " ", "d"]) test.panel.handleInput(key);
 		expect(test.text()).toContain("No registered tools found"); test.panel.handleInput("\r");
 		expect(test.saved()?.globalExposures).toEqual({ offline: "deferred" });
+	});
+	it("keeps Markdown and multiline descriptions in one physical row, with no stale search text", () => {
+		const search = { ...tool("tool_search", "model-only"), description: "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nSome of the tools may not have been provided upfront." };
+		const test = setup({ tools: [tool("docs"), tool("codemode", "model-only"), search] });
+		const initial = test.panel.render(80);
+		test.panel.handleInput("\x1b[F");
+		const searchFrame = test.panel.render(80);
+		expect(searchFrame.length).toBe(initial.length);
+		expect(searchFrame.some((line) => line.startsWith("Searches over deferred"))).toBe(true);
+		expect(searchFrame.join("\n")).not.toContain("# Tool discovery");
+		for (const line of searchFrame) expect(line).not.toMatch(/[\r\n\t\u2028\u2029]/u);
+		for (const key of ["k", "k", "j", "j", "k"]) {
+			test.panel.handleInput(key);
+			const frame = test.panel.render(80);
+			expect(frame.length).toBe(initial.length);
+			expect(frame.findIndex((line) => line.includes("↑↓/jk"))).toBe(initial.findIndex((line) => line.includes("↑↓/jk")));
+			if (!frame.some((line) => line.startsWith("→") && line.includes("tool_search"))) {
+				expect(frame.join("\n")).not.toContain("Searches over deferred");
+			}
+		}
+	});
+	it("extracts a single sentence from headings, CRLF, tabs, and wrapped paragraphs", () => {
+		expect(firstSentence("# Heading\r\n\r\nWrapped\r\nsentence\tends here. Next sentence.")).toBe("Wrapped sentence ends here.");
+		expect(firstSentence("\n中文\n描述。下一句。")).toBe("中文 描述。");
+		expect(firstSentence("No punctuation\nsecond line")).toBe("No punctuation second line");
+		expect(firstSentence("## Heading only\n\n")).toBe("");
+		expect(firstSentence(undefined)).toBe("");
+	});
+	it("bounds large lists, scrolls only at the edges, and pages by the visible count", () => {
+		const tools = Array.from({ length: 100 }, (_, i) => tool(`tool_${String(i).padStart(3, "0")}`));
+		const test = setup({ tools });
+		const rows = () => test.panel.render(100).filter((line) => /^[→ ] [●○] /.test(line));
+		expect(rows()).toHaveLength(12);
+		expect(test.text()).toContain("1–12 / 100 · ↓ more");
+		for (let i = 0; i < 11; i++) test.panel.handleInput("j");
+		expect(test.text()).toContain("1–12 / 100");
+		test.panel.handleInput("j");
+		expect(test.text()).toContain("2–13 / 100 · ↑ more · ↓ more");
+		test.panel.handleInput("\x1b[6~");
+		expect(rows().find((line) => line.startsWith("→"))).toContain("tool_024");
+		test.panel.handleInput("\x1b[5~");
+		expect(rows().find((line) => line.startsWith("→"))).toContain("tool_012");
+		test.panel.handleInput("\x1b[F");
+		expect(test.text()).toContain("89–100 / 100 · ↑ more");
+		expect(test.text()).not.toContain("↓ more");
+		expect(rows().find((line) => line.startsWith("→"))).toContain("tool_099");
+		test.panel.handleInput("j");
+		expect(rows()).toHaveLength(12);
+		test.panel.handleInput("\x1b[H");
+		test.panel.handleInput("k");
+		expect(rows()[0]).toStartWith("→ ○ tool_000");
+		expect(test.text()).not.toContain("↑ more");
+	});
+	it("keeps separators and footer stationary while crossing and scrolling past locked tools", () => {
+		const tools = sortTools([...Array.from({ length: 20 }, (_, i) => tool(`editable_${i}`)),
+			...Array.from({ length: 20 }, (_, i) => tool(`locked_${i}`, "model-only"))]);
+		const test = setup({ tools });
+		const initial = test.panel.render(100);
+		const separators = (lines: string[]) => lines.flatMap((line, i) => line.startsWith("─") ? [i] : []);
+		for (let i = 0; i < tools.length; i++) {
+			const frame = test.panel.render(100);
+			expect(frame).toHaveLength(initial.length);
+			expect(separators(frame)).toEqual(separators(initial));
+			for (const index of separators(frame)) {
+				expect(frame[index - 1]?.trim()).not.toBe("");
+				expect(frame[index + 1]?.trim()).not.toBe("");
+			}
+			expect(frame.filter((line) => line.startsWith("→"))).toHaveLength(1);
+			test.panel.handleInput("j");
+		}
+	});
+	it("adapts to terminal height and resize without hiding the selected tool or footer", () => {
+		const terminal = { rows: 40 };
+		const test = setup({ tools: Array.from({ length: 50 }, (_, i) => tool(`tool_${i}`)),
+			tui: { terminal, requestRender() {} } as TUI });
+		test.panel.handleInput("\x1b[F");
+		for (const height of [40, 24, 21, 18, 15, 30, 50]) {
+			terminal.rows = height;
+			const frame = test.panel.render(80);
+			expect(frame.length).toBeLessThanOrEqual(height - 2);
+			expect(frame.find((line) => line.startsWith("→"))).toContain("tool_49");
+			expect(frame.at(-1)).toContain("Esc cancel");
+			expect(frame.filter((line) => /^[→ ] [●○] /.test(line)).length).toBeLessThanOrEqual(12);
+		}
+		terminal.rows = 24;
+		test.panel.handleInput("\x1b[H");
+		const visible = test.panel.render(80).filter((line) => /^[→ ] [●○] /.test(line)).length;
+		test.panel.handleInput("\x1b[6~");
+		expect(test.panel.render(80).find((line) => line.startsWith("→"))).toContain(`tool_${visible} `);
+	});
+	it("keeps notice rows stable and clears stale notices when moving to another tool", () => {
+		const test = setup({ tools: [tool("codemode", "model-only"), tool("docs")] });
+		const initial = test.panel.render(100);
+		test.panel.handleInput(" ");
+		expect(test.panel.render(100)).toHaveLength(initial.length);
+		expect(test.text()).toContain("Native service tools are managed by Pi");
+		test.panel.handleInput("j");
+		expect(test.panel.render(100)).toHaveLength(initial.length);
+		expect(test.text()).not.toContain("Native service tools are managed by Pi");
+	});
+	it("clips long names by display columns without shifting mode and source columns", () => {
+		const test = setup({ tools: [tool("中文工具".repeat(10)), tool("short")] });
+		const rows = test.panel.render(80).filter((line) => /^[→ ] [●○] /.test(line));
+		expect(rows[0]).toContain("...");
+		expect(visibleWidth(rows[0]!.split("direct")[0]!)).toBe(visibleWidth(rows[1]!.split("direct")[0]!));
+	});
+	it("offers a safe resize hint on very short terminals and still permits cancellation", () => {
+		const test = setup({ tui: { terminal: { rows: 10 }, requestRender() {} } as TUI });
+		expect(test.text()).toContain("Enlarge terminal");
+		test.panel.handleInput("q");
+		expect(test.closed()).toBe(true);
+		const saving = setup({ tui: { terminal: { rows: 10 }, requestRender() {} } as TUI });
+		saving.panel.handleInput(" ");
+		saving.panel.handleInput("\r");
+		expect(saving.saved()?.globalExposures).toEqual({});
 	});
 	it("sorts editable extension tools before locked ones", () => {
 		const sorted = sortTools([tool("old"), tool("docs", "deferred"), tool("tool_search", "model-only"), tool("read", "direct", "builtin")]);
