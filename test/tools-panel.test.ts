@@ -121,10 +121,11 @@ describe("layered exposure panel", () => {
 			tool("tool_search", "model-only"), tool("codemode", "model-only")]) {
 			const test = setup({ tools: [entry] }); test.panel.handleInput(" "); test.panel.handleInput("\r");
 			expect(test.saved()?.globalExposures).toEqual({});
-			expect(test.text()).toContain("locked");
+			expect(test.text()).toContain("⊘");
 		}
 		const mixed = setup({ tools: sortTools([tool("read", "direct", "builtin"), tool("docs")]) });
-		expect(mixed.text()).toContain("locked (1)");
+		expect(mixed.text()).toContain("read");
+		expect(mixed.text()).toContain("builtin ⊘");
 	});
 	it("locks project scope when untrusted or overridden by environment", () => {
 		for (const opts of [{ canUseProjectScope: false }, { isEnvOverridden: true }]) {
@@ -134,7 +135,6 @@ describe("layered exposure panel", () => {
 	it("shows loaded state independently from exposure", () => {
 		const test = setup({ initialGlobalExposures: { docs: "deferred" }, activeNames: new Set(["docs"]) });
 		expect(test.text()).toContain("●");
-		expect(test.text()).toContain("loaded in context");
 		expect(test.text()).toContain("direct → deferred");
 	});
 	it("fits narrow terminal widths with Chinese and ANSI", () => {
@@ -181,17 +181,17 @@ describe("layered exposure panel", () => {
 		const test = setup({ tools });
 		const rows = () => test.panel.render(100).filter((line) => /^[→ ] [●○] /.test(line));
 		expect(rows()).toHaveLength(12);
-		expect(test.text()).toContain("1–12 / 100 · ↓ more");
+		expect(test.text()).toContain("1 / 100 · ↓ more");
 		for (let i = 0; i < 11; i++) test.panel.handleInput("j");
-		expect(test.text()).toContain("1–12 / 100");
+		expect(test.text()).toContain("12 / 100");
 		test.panel.handleInput("j");
-		expect(test.text()).toContain("2–13 / 100 · ↑ more · ↓ more");
+		expect(test.text()).toContain("13 / 100 · ↑ more · ↓ more");
 		test.panel.handleInput("\x1b[6~");
 		expect(rows().find((line) => line.startsWith("→"))).toContain("tool_024");
 		test.panel.handleInput("\x1b[5~");
 		expect(rows().find((line) => line.startsWith("→"))).toContain("tool_012");
 		test.panel.handleInput("\x1b[F");
-		expect(test.text()).toContain("89–100 / 100 · ↑ more");
+		expect(test.text()).toContain("100 / 100 · ↑ more");
 		expect(test.text()).not.toContain("↓ more");
 		expect(rows().find((line) => line.startsWith("→"))).toContain("tool_099");
 		test.panel.handleInput("j");

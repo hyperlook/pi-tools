@@ -81,14 +81,13 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 	const hasOwn = (tool: ToolInfo) => Object.hasOwn(drafts[scope], tool.name);
 	const shadowed = (tool: ToolInfo) => scope === "global" && Object.hasOwn(drafts.project, tool.name);
 	const changes = () => changedCount(drafts.global, opts.initialGlobalExposures) + changedCount(drafts.project, opts.initialProjectExposures);
-	const editableCount = tools.filter(isManageable).length;
 	const singleLine = (text: string) => text.replace(/\s+/gu, " ").trim();
 	const nameWidth = tools.reduce((max, tool) => Math.max(max, visibleWidth(singleLine(tool.name))), 0);
 	function layout() {
 		const rows = tui.terminal?.rows ?? 30;
 		const compact = rows < 22;
 		// Reserve two rows for the host UI. All non-list regions have stable heights.
-		const fixedRows = compact ? 12 : 15;
+		const fixedRows = compact ? 10 : 12;
 		return { compact, tooShort: rows < 15, height: Math.min(12, Math.max(1, rows - 2 - fixedRows)) };
 	}
 	const accent = (text: string) => theme.fg("accent", text);
@@ -118,7 +117,7 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 			const nameCol = Math.min(28, Math.max(4, nameWidth), Math.max(4, width - 40));
 			const modeCol = 22;
 			lines.push(dim(`    ${"tool".padEnd(nameCol)}  ${"mode".padEnd(modeCol)}  source`));
-			lines.push(rule(`editable (${editableCount}) · locked (${tools.length - editableCount})`));
+			lines.push(rule());
 			for (let i = start; i < Math.min(tools.length, start + height); i++) {
 				const tool = tools[i]!;
 				const dot = activeNames.has(tool.name) ? theme.fg("success", "●") : dim("○");
@@ -135,34 +134,34 @@ export function createToolsPanel(opts: ToolsPanelOptions) {
 					sourceText = dim(shadowed(tool) ? `global · project: ${drafts.project[tool.name]}` : source);
 				} else {
 					modeText = dim(String(exposureOf(tool)).padEnd(modeCol));
-					sourceText = dim(`locked · ${toolKind(tool)}`);
+					sourceText = dim(`${toolKind(tool)} ⊘`);
 				}
 				lines.push(`${i === selected ? "→" : " "} ${dot} ${name}  ${modeText}  ${sourceText}`);
 			}
 			if (!tools.length) lines.push(theme.fg("muted", "No registered tools found"));
 			const tool = tools[selected];
 			const end = Math.min(tools.length, start + height);
-			lines.push(rule(tools.length ? `${start + 1}–${end} / ${tools.length}${start > 0 ? " · ↑ more" : ""}${end < tools.length ? " · ↓ more" : ""}` : "0 tools"));
+			lines.push(rule(tools.length ? `${selected + 1} / ${tools.length}${start > 0 ? " · ↑ more" : ""}${end < tools.length ? " · ↓ more" : ""}` : "0 tools"));
 			// Each detail owns exactly one physical terminal row, including locked/empty states.
-			const details = ["", "", "", ""];
+			const details = ["", ""];
 			if (tool) {
 				const reason = lockReason(tool);
 				const { mode } = resolve(tool);
-				details[0] = theme.bold(singleLine(tool.name));
-				details[1] = firstSentence(tool.description) || "(no description)";
-				details[2] = reason ? theme.fg("warning", reason) : theme.fg("muted", [`default: ${original(tool)}`, `live: ${exposureOf(tool)}`,
-					activeNames.has(tool.name) ? "loaded in context" : "not loaded"].join(" · "));
-				details[3] = reason ? dim(activeNames.has(tool.name) ? "loaded in context" : "not loaded") : dim(MODE_HINTS[mode] ?? "");
+				details[0] = firstSentence(tool.description) || "(no description)";
+				details[1] = reason ? theme.fg("warning", reason) : dim(MODE_HINTS[mode] ?? "");
 			}
-			lines.push(...details.slice(0, compact ? 3 : 4));
+			lines.push(...details);
 			const n = changes();
 			const selectedTool = tool && isManageable(tool) ? tool : undefined;
 			const fmt = (keys: (string[] | false)[]) => keys.filter((k): k is string[] => !!k)
 				.map(([k, v]) => `${accent(k!)} ${dim(v!)}`).join(dim(" · "));
-			lines.push(notice ? theme.fg("warning", notice) : "",
+			lines.push(
+				notice ? theme.fg("warning", notice) : fmt([
+					!!selectedTool && ["←→/Space", "change mode"],
+					!!selectedTool && hasOwn(selectedTool) && ["d", "clear override"],
+					scope === "project" && !projectEmpty && ["r", "clear all project overrides"],
+				]),
 				fmt([["↑↓/jk", "move"], ["PgUp/PgDn", "page"], ["Home/End", "first/last"]]),
-				fmt([!!selectedTool && ["←→/Space", "change mode"], !!selectedTool && hasOwn(selectedTool) && ["d", "clear override"],
-					scope === "project" && !projectEmpty && ["r", "clear all project overrides"]]),
 				fmt([["Tab", `scope → ${scope === "global" ? "project" : "global"}`],
 					["Enter", `save & reload${n ? ` (${plural(n, "change")})` : ""}`], ["Esc", "cancel"]]));
 			// Do not collapse layout padding; only normalize embedded row-breaking characters.
