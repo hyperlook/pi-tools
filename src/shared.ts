@@ -17,6 +17,9 @@ export function configuredExposure(overrides: ToolExposures, name: string, origi
 export function nextExposure(mode: ExposureMode): ExposureMode {
 	return EXPOSURE_MODES[(EXPOSURE_MODES.indexOf(mode) + 1) % EXPOSURE_MODES.length]!;
 }
+export function prevExposure(mode: ExposureMode): ExposureMode {
+	return EXPOSURE_MODES[(EXPOSURE_MODES.indexOf(mode) + EXPOSURE_MODES.length - 1) % EXPOSURE_MODES.length]!;
+}
 export function firstSentence(text: string | undefined): string {
 	return (text?.match(/^.+?(?:[。！!？?]|(?:\.\s)|\.$|$)/)?.[0] ?? text ?? "").trim();
 }

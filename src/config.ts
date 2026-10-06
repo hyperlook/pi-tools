@@ -42,7 +42,7 @@ export function readScopeConfig(scope: ConfigScope, cwd: string): ToolExposures 
 	return readConfigFile(process.env.PI_TOOLS_CONFIG ||
 		(scope === "project" ? getProjectConfigPath(cwd) : getGlobalConfigPath()));
 }
-/** Trusted project config replaces the global map, including an explicitly empty map. */
+/** Layers resolve per tool: author default → global → trusted project. Project holds sparse overrides only. */
 export function resolveEffectiveConfig(cwd: string, trusted: boolean): ConfigResolution {
 	if (process.env.PI_TOOLS_CONFIG) {
 		return { scope: "global", path: process.env.PI_TOOLS_CONFIG,
@@ -50,11 +50,12 @@ export function resolveEffectiveConfig(cwd: string, trusted: boolean): ConfigRes
 	}
 	const projectPath = getProjectConfigPath(cwd);
 	const project = trusted ? readConfigFile(projectPath) : undefined;
-	if (project !== undefined) {
-		return { scope: "project", path: projectPath, toolExposures: project, isEnvOverridden: false };
-	}
 	const path = getGlobalConfigPath();
-	return { scope: "global", path, toolExposures: readConfigFile(path) ?? {}, isEnvOverridden: false };
+	const global = readConfigFile(path) ?? {};
+	if (project !== undefined) {
+		return { scope: "project", path: projectPath, toolExposures: { ...global, ...project }, isEnvOverridden: false };
+	}
+	return { scope: "global", path, toolExposures: global, isEnvOverridden: false };
 }
 export function deleteProjectConfigFile(cwd: string): void {
 	rmSync(getProjectConfigPath(cwd), { force: true });

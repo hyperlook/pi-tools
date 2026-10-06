@@ -15,46 +15,55 @@ function setup(overrides: Partial<ToolsPanelOptions> = {}) {
 		tui, theme, kb, done: (result) => { saved = result; closed = true; }, tools: [tool("docs")],
 		originalExposures: new Map(), activeNames: new Set(),
 		initialScope: "global", canUseProjectScope: true, projectDisplayPath: ".pi/pi-tools.json",
-		globalDisplayPath: "~/.pi/agent/pi-tools.json", initialGlobalExposures: {}, initialProjectExposures: undefined,
+		globalDisplayPath: "~/.pi/agent/pi-tools.json", initialGlobalExposures: {}, initialProjectExposures: {},
 		...overrides,
 	});
 	return { panel, saved: () => saved, closed: () => closed, text: () => panel.render(160).join("\n") };
 }
-describe("three native exposure choices", () => {
+describe("layered exposure panel", () => {
 	it("makes unconfigured direct tools editable and cycles direct, codemode, deferred", () => {
 		const test = setup();
 		expect(test.text()).toContain("docs  direct");
-		expect(test.text()).not.toContain("只读");
+		expect(test.text()).toContain("default");
 		test.panel.handleInput(" ");
-		expect(test.text()).toContain("docs  codemode *");
+		expect(test.text()).toContain("direct → codemode");
+		expect(test.text()).toContain("1 change");
 		test.panel.handleInput(" ");
-		expect(test.text()).toContain("docs  deferred *");
+		expect(test.text()).toContain("direct → deferred");
 		test.panel.handleInput(" ");
 		test.panel.handleInput("\r");
 		expect(test.saved()?.globalExposures).toEqual({ docs: "direct" });
 	});
-	it("starts from the author's exposure, not a synthetic inherit state", () => {
+	it("steps backwards with the left arrow", () => {
+		const test = setup();
+		test.panel.handleInput("\x1b[D"); test.panel.handleInput("\r");
+		expect(test.saved()?.globalExposures).toEqual({ docs: "deferred" });
+	});
+	it("starts from the author's exposure", () => {
 		const test = setup({ tools: [tool("docs", "deferred")] });
 		expect(test.text()).toContain("docs  deferred");
 		test.panel.handleInput(" "); test.panel.handleInput("\r");
 		expect(test.saved()?.globalExposures).toEqual({ docs: "direct" });
 	});
-	it("can reset to the original definition rather than the already-overridden effective exposure", () => {
+	it("clears an override back to the original definition, not the overridden live value", () => {
 		const test = setup({ tools: [tool("docs", "deferred")], originalExposures: new Map([["docs", "direct"]]),
 			initialGlobalExposures: { docs: "deferred" } });
+		expect(test.text()).toContain("clear override");
 		test.panel.handleInput("d");
-		expect(test.text()).toContain("target: direct");
-		expect(test.text()).toContain("current: deferred");
+		expect(test.text()).toContain("deferred → direct");
+		expect(test.text()).not.toContain("clear override");
 		test.panel.handleInput("\r");
 		expect(test.saved()?.globalExposures).toEqual({});
 	});
-	it("keeps changes in a draft until completion", () => {
+	it("counts unsaved changes and drops them when reverted", () => {
 		const test = setup();
+		expect(test.text()).toContain("Enter save & reload");
+		expect(test.text()).not.toContain("change)");
 		test.panel.handleInput(" ");
 		expect(test.saved()).toBeUndefined();
-		expect(test.text()).toContain("unsaved *");
+		expect(test.text()).toContain("(1 change)");
 		test.panel.handleInput("d");
-		expect(test.text()).not.toContain("unsaved *");
+		expect(test.text()).not.toContain("(1 change)");
 		test.panel.handleInput(" "); test.panel.handleInput("\r");
 		expect(test.saved()?.globalExposures).toEqual({ docs: "codemode" });
 		expect(test.closed()).toBe(true);
@@ -65,17 +74,34 @@ describe("three native exposure choices", () => {
 			expect(test.saved()).toBeUndefined(); expect(test.closed()).toBe(true);
 		}
 	});
-	it("forks project overrides from global on the first edit", () => {
+	it("project edits are sparse: only the touched tool is stored", () => {
 		const test = setup({ initialScope: "project", initialGlobalExposures: { docs: "direct", offline: "deferred" } });
-		expect(test.text()).toContain("inherit global");
+		expect(test.text()).toContain("inheriting global");
 		test.panel.handleInput(" "); test.panel.handleInput("\r");
-		expect(test.saved()).toEqual({ globalExposures: { docs: "direct", offline: "deferred" },
-			projectExposures: { docs: "codemode", offline: "deferred" } });
+		expect(test.saved()).toEqual({ globalExposures: { docs: "direct", offline: "deferred" }, projectExposures: { docs: "codemode" } });
 	});
-	it("resets project overrides to global inheritance", () => {
-		const test = setup({ initialScope: "project", initialProjectExposures: { docs: "direct" } });
-		test.panel.handleInput("r"); expect(test.text()).toContain("inherit global"); test.panel.handleInput("\r");
-		expect(test.saved()?.projectExposures).toBeUndefined();
+	it("shows where each value comes from", () => {
+		const tools = [tool("a"), tool("b"), tool("c")];
+		const test = setup({ tools, initialScope: "project", initialGlobalExposures: { b: "deferred", c: "deferred" },
+			initialProjectExposures: { c: "codemode" } });
+		const rows = test.text().split("\n");
+		expect(rows.find((r) => r.includes(" a "))).toMatch(/direct\s+default/);
+		expect(rows.find((r) => r.includes(" b "))).toMatch(/deferred\s+global/);
+		expect(rows.find((r) => r.includes(" c "))).toMatch(/codemode\s+project/);
+	});
+	it("global view ignores project overrides but flags the shadowing", () => {
+		const test = setup({ initialGlobalExposures: { docs: "deferred" }, initialProjectExposures: { docs: "codemode" } });
+		expect(test.text()).toContain("deferred");
+		expect(test.text()).toContain("project: codemode");
+	});
+	it("clears all project overrides with r, and only offers it when there are some", () => {
+		const test = setup({ initialScope: "project", initialProjectExposures: { docs: "deferred" }, initialGlobalExposures: { docs: "direct" } });
+		expect(test.text()).toContain("clear all project");
+		test.panel.handleInput("r");
+		expect(test.text()).toContain("inheriting global");
+		expect(test.text()).not.toContain("clear all project");
+		test.panel.handleInput("\r");
+		expect(test.saved()?.projectExposures).toEqual({});
 	});
 	it("edits all three ordinary exposures, but protects model-only and hidden", () => {
 		for (const exposure of ["direct", "codemode", "deferred", "model-only", "hidden"] as const) {
@@ -85,24 +111,26 @@ describe("three native exposure choices", () => {
 				deferred: { docs: "direct" }, "model-only": {}, hidden: {} }[exposure]);
 		}
 	});
-	it("protects builtins, SDK-only tools and dispatchers", () => {
+	it("protects builtins, SDK-only tools and dispatchers, and groups them as locked", () => {
 		for (const entry of [tool("read", "direct", "builtin"), tool("sdk", "direct", "sdk"),
 			tool("tool_search", "model-only"), tool("codemode", "model-only")]) {
 			const test = setup({ tools: [entry] }); test.panel.handleInput(" "); test.panel.handleInput("\r");
 			expect(test.saved()?.globalExposures).toEqual({});
-			expect(test.text()).toContain("readonly");
+			expect(test.text()).toContain("locked");
 		}
+		const mixed = setup({ tools: sortTools([tool("read", "direct", "builtin"), tool("docs")]) });
+		expect(mixed.text()).toContain("locked (1)");
 	});
 	it("locks project scope when untrusted or overridden by environment", () => {
 		for (const opts of [{ canUseProjectScope: false }, { isEnvOverridden: true }]) {
-			const test = setup(opts); test.panel.handleInput("\t"); expect(test.text()).toContain("Global");
+			const test = setup(opts); test.panel.handleInput("\t"); expect(test.text()).toContain("[Global]");
 		}
 	});
-	it("shows declaration status independently from exposure", () => {
+	it("shows loaded state independently from exposure", () => {
 		const test = setup({ initialGlobalExposures: { docs: "deferred" }, activeNames: new Set(["docs"]) });
 		expect(test.text()).toContain("●");
-		expect(test.text()).toContain("deferred *");
-		expect(test.text()).toContain("Enter save & reload");
+		expect(test.text()).toContain("loaded in context");
+		expect(test.text()).toContain("direct → deferred");
 	});
 	it("fits narrow terminal widths with Chinese and ANSI", () => {
 		const ansiTheme = { fg: (_: string, text: string) => `\x1b[36m${text}\x1b[0m`,
@@ -116,8 +144,8 @@ describe("three native exposure choices", () => {
 		expect(test.text()).toContain("No registered tools found"); test.panel.handleInput("\r");
 		expect(test.saved()?.globalExposures).toEqual({ offline: "deferred" });
 	});
-	it("sorts direct and native tools together after builtin and service tools", () => {
+	it("sorts editable extension tools before locked ones", () => {
 		const sorted = sortTools([tool("old"), tool("docs", "deferred"), tool("tool_search", "model-only"), tool("read", "direct", "builtin")]);
-		expect(sorted.map((t) => t.name)).toEqual(["read", "tool_search", "docs", "old"]);
+		expect(sorted.map((t) => t.name)).toEqual(["docs", "old", "read", "tool_search"]);
 	});
 });

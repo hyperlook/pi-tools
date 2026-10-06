@@ -32,11 +32,17 @@ describe("exposure override config", () => {
 		writeConfigFile(global, { old: "deferred", docs: "direct", image: "codemode" });
 		expect(resolveEffectiveConfig(cwd, true).toolExposures).toEqual({ old: "deferred", docs: "direct", image: "codemode" });
 	});
-	it("trusted project replaces the global map, including with an empty map", () => {
+	it("trusted project overlays global per tool", () => {
+		writeConfigFile(global, { docs: "direct", old: "deferred" });
+		writeConfigFile(getProjectConfigPath(cwd), { docs: "codemode" });
+		const resolved = resolveEffectiveConfig(cwd, true);
+		expect(resolved.scope).toBe("project");
+		expect(resolved.toolExposures).toEqual({ docs: "codemode", old: "deferred" });
+	});
+	it("an empty project file inherits everything from global", () => {
 		writeConfigFile(global, { docs: "direct" });
 		writeConfigFile(getProjectConfigPath(cwd), {});
-		expect(resolveEffectiveConfig(cwd, true).scope).toBe("project");
-		expect(resolveEffectiveConfig(cwd, true).toolExposures).toEqual({});
+		expect(resolveEffectiveConfig(cwd, true).toolExposures).toEqual({ docs: "direct" });
 	});
 	it("never reads untrusted project overrides", () => {
 		writeConfigFile(global, { docs: "direct" });

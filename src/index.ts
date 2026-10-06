@@ -39,12 +39,12 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			canUseProjectScope: trusted, projectDisplayPath: ".pi/pi-tools.json",
 			globalDisplayPath: formatDisplayPath(getGlobalConfigPath()), isEnvOverridden: effective.isEnvOverridden,
 			initialGlobalExposures: readScopeConfig("global", ctx.cwd) ?? {},
-			initialProjectExposures: !effective.isEnvOverridden && trusted ? readScopeConfig("project", ctx.cwd) : undefined,
+			initialProjectExposures: !effective.isEnvOverridden && trusted ? readScopeConfig("project", ctx.cwd) ?? {} : {},
 		}));
 		if (!result) return;
 		saveScopeConfig({ scope: "global", cwd: ctx.cwd, exposures: result.globalExposures });
 		if (!effective.isEnvOverridden && trusted) {
-			if (result.projectExposures === undefined) deleteProjectConfigFile(ctx.cwd);
+			if (!Object.keys(result.projectExposures).length) deleteProjectConfigFile(ctx.cwd);
 			else saveScopeConfig({ scope: "project", cwd: ctx.cwd, exposures: result.projectExposures });
 		}
 		ctx.ui.notify("Exposure 覆盖已保存，正在重载", "info");
